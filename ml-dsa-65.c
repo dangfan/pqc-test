@@ -1161,3 +1161,84 @@ int ml_dsa_65_verify(const uint8_t *msg, size_t msg_len,
 
   return 0;
 }
+
+/* ------------------------------------------------------------------ */
+/*  Self-test (FIPS 140-3 style KAT + round-trip)                      */
+/* ------------------------------------------------------------------ */
+
+int ml_dsa_65_selftest(void) {
+  /* ACVP tcId 26 seed */
+  static const uint8_t seed[32] = {
+    0x1B, 0xD6, 0x7D, 0xC7, 0x82, 0xB2, 0x95, 0x8E,
+    0x18, 0x9E, 0x31, 0x5C, 0x04, 0x0D, 0xD1, 0xF6,
+    0x4C, 0x8A, 0xB2, 0x32, 0xA6, 0xA1, 0x70, 0xE1,
+    0xA7, 0xA5, 0x2C, 0x33, 0xF1, 0x08, 0x51, 0xB1
+  };
+
+  /* Expected SHA3-256 digests of pk and sk */
+  static const uint8_t expected_pk_hash[32] = {
+    0xaa, 0xa0, 0x7f, 0x58, 0x6d, 0x78, 0xb6, 0x7b,
+    0x96, 0x4d, 0xe8, 0xde, 0xf0, 0xdf, 0x7f, 0x34,
+    0xa6, 0xc1, 0x60, 0xf1, 0x10, 0xba, 0x70, 0x1a,
+    0x7c, 0x1a, 0x28, 0xb9, 0xba, 0x2f, 0x8b, 0xa6
+  };
+  static const uint8_t expected_sk_hash[32] = {
+    0x0a, 0xd8, 0xc5, 0x37, 0x1e, 0x61, 0xcd, 0x02,
+    0x6e, 0x0d, 0xad, 0x72, 0xdf, 0xc3, 0x74, 0x08,
+    0x40, 0x18, 0x7e, 0x20, 0x94, 0xc2, 0x7f, 0x91,
+    0x5e, 0xb5, 0xce, 0xf8, 0xfd, 0x19, 0x12, 0x6e
+  };
+
+  /* Expected SHA3-256 digest of signature (deterministic, msg below, no ctx) */
+  static const uint8_t expected_sig_hash[32] = {
+    0xf9, 0xad, 0x98, 0xe1, 0x6f, 0xdd, 0x68, 0x0c,
+    0xa7, 0x85, 0x86, 0x51, 0xb0, 0xef, 0x3f, 0x16,
+    0x34, 0x36, 0xa0, 0x74, 0xdf, 0xf9, 0x6e, 0x63,
+    0x2f, 0xb7, 0x9b, 0x13, 0x64, 0x50, 0xfb, 0x31
+  };
+
+  static uint8_t pk[MLDSA_PK_BYTES];
+  static uint8_t sk[MLDSA_SK_BYTES];
+  static uint8_t sig[MLDSA_SIG_BYTES];
+  uint8_t digest[32];
+  size_t sig_len = 0;
+
+  static const uint8_t msg[] = "test message for ML-DSA-65";
+  static const size_t msg_len = sizeof(msg) - 1;
+
+  /* 1. KeyGen KAT */
+  if (ml_dsa_65_keygen(pk, sk, seed) != 0)
+    return -1;
+
+  sha3_256_raw(pk, MLDSA_PK_BYTES, digest);
+  if (memcmp(digest, expected_pk_hash, 32) != 0)
+    return -2;
+
+  sha3_256_raw(sk, MLDSA_SK_BYTES, digest);
+  if (memcmp(digest, expected_sk_hash, 32) != 0)
+    return -3;
+
+  /* 2. Sign KAT (deterministic) */
+  if (ml_dsa_65_sign(sig, &sig_len, msg, msg_len, NULL, 0, sk) != 0)
+    return -4;
+
+  if (sig_len != MLDSA_SIG_BYTES)
+    return -5;
+
+  sha3_256_raw(sig, sig_len, digest);
+  if (memcmp(digest, expected_sig_hash, 32) != 0)
+    return -6;
+
+  /* 3. Verify round-trip */
+  if (ml_dsa_65_verify(msg, msg_len, sig, sig_len, NULL, 0, pk) != 0)
+    return -7;
+
+  /* 4. Verify rejects wrong message */
+  {
+    static const uint8_t bad[] = "wrong message";
+    if (ml_dsa_65_verify(bad, sizeof(bad) - 1, sig, sig_len, NULL, 0, pk) == 0)
+      return -8;
+  }
+
+  return 0;
+}
