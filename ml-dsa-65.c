@@ -105,48 +105,50 @@ static void pke_load_poly(int32_t p[N], int base_reg) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Hardware MMM setup for Q (scalar, pkeLen=2)                        */
-/*  PKE registers use big-endian byte order.                           */
+/*  Host ↔ PKE byte-order helpers                                     */
+/*                                                                      */
+/*  PKE registers store multi-precision integers in big-endian byte     */
+/*  order: the most significant byte is at the lowest address.          */
+/*  On the host side, scalar uint32_t values use native byte order,     */
+/*  and multi-word integers use word[0] = least significant (LE word    */
+/*  order).  The helpers below convert between the two conventions.     */
 /* ------------------------------------------------------------------ */
 
-/* Write 32-bit value into upper half of 8-byte BE register (value * 2^32). */
-static void write_be32_hi(int reg_idx, uint32_t val) {
-  uint8_t buf[8] = {0};
-  buf[0] = (uint8_t)(val >> 24);
-  buf[1] = (uint8_t)(val >> 16);
-  buf[2] = (uint8_t)(val >>  8);
-  buf[3] = (uint8_t)(val      );
-  eccPKEWriteBuf(reg_idx, (const uint32_t *)buf, 2);
+/* Convert a single uint32_t between host byte order and big-endian. */
+static inline uint32_t host_to_be32(uint32_t x) {
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+  return x;
+#else
+  return __builtin_bswap32(x);
+#endif
+}
+#define be32_to_host(x) host_to_be32(x)  /* same operation, symmetric */
+
+/* Write 32-bit value into upper half of 8-byte PKE register (value * 2^32). */
+static void write_pke_hi32(int reg_idx, uint32_t val) {
+  uint32_t buf[2] = { host_to_be32(val), 0 };
+  eccPKEWriteBuf(reg_idx, buf, 2);
 }
 
-/* Write 32-bit value into lower half of 8-byte BE register. */
-static void write_be32_lo(int reg_idx, uint32_t val) {
-  uint8_t buf[8] = {0};
-  buf[4] = (uint8_t)(val >> 24);
-  buf[5] = (uint8_t)(val >> 16);
-  buf[6] = (uint8_t)(val >>  8);
-  buf[7] = (uint8_t)(val      );
-  eccPKEWriteBuf(reg_idx, (const uint32_t *)buf, 2);
+/* Write 32-bit value into lower half of 8-byte PKE register. */
+static void write_pke_lo32(int reg_idx, uint32_t val) {
+  uint32_t buf[2] = { 0, host_to_be32(val) };
+  eccPKEWriteBuf(reg_idx, buf, 2);
 }
 
-/* Read 32-bit value from lower half of 8-byte BE register. */
-static uint32_t read_be32_lo(int reg_idx) {
-  uint8_t buf[8];
-  eccPKEReadBuf((uint32_t *)buf, reg_idx, 2);
-  return ((uint32_t)buf[4] << 24) | ((uint32_t)buf[5] << 16) |
-         ((uint32_t)buf[6] <<  8) | ((uint32_t)buf[7]);
+/* Read 32-bit value from lower half of 8-byte PKE register. */
+static uint32_t read_pke_lo32(int reg_idx) {
+  uint32_t buf[2];
+  eccPKEReadBuf(buf, reg_idx, 2);
+  return be32_to_host(buf[1]);
 }
 
 static void pke_mmm_setup(void) {
   rsaPKESetLen(2);
-  write_be32_lo(0, Q);                   /* reg 0 = Q (big-endian, lower half) */
-  uint8_t mod_buf[8] = {0};
-  mod_buf[4] = (uint8_t)(Q >> 24);
-  mod_buf[5] = (uint8_t)(Q >> 16);
-  mod_buf[6] = (uint8_t)(Q >>  8);
-  mod_buf[7] = (uint8_t)(Q      );
+  write_pke_lo32(0, Q);
+  uint32_t mod_words[2] = { 0, host_to_be32(Q) };
   uint32_t mc[2];
-  eccCalMc64(mc, (const uint32_t *)mod_buf);
+  eccCalMc64(mc, mod_words);
   rsaPKEWriteMc(mc);
 }
 
@@ -156,10 +158,10 @@ static void pke_mmm_setup(void) {
  *   MonMul(a*2^32, b) = a*2^32 * b * 2^{-64} mod Q = a * b * 2^{-32} mod Q
  * This matches the original R=2^32 Montgomery behavior. */
 static int32_t hw_mon_mul(int32_t a, int32_t b) {
-  write_be32_hi(1, (uint32_t)freeze(a));
-  write_be32_lo(2, (uint32_t)freeze(b));
+  write_pke_hi32(1, (uint32_t)freeze(a));
+  write_pke_lo32(2, (uint32_t)freeze(b));
   sm2MonMul(3, 1, 2);
-  return (int32_t)read_be32_lo(3);
+  return (int32_t)read_pke_lo32(3);
 }
 
 /* ------------------------------------------------------------------ */
@@ -242,8 +244,9 @@ static void poly_pointwise_acc(int32_t c[N], const int32_t a[N],
 /*    - Total: 256 HW multiplies (vs ~2304 in NTT approach).           */
 /* ------------------------------------------------------------------ */
 
-/* Pack KRON_G non-negative coefficients into a big integer.
- * Each coefficient occupies KRON_L bits. Packed little-endian by bit. */
+/* Pack KRON_G non-negative coefficients into a multi-word integer.
+ * Each coefficient occupies KRON_L bits at a KRON_L-bit stride.
+ * Result is in host word order (word[0] = least significant). */
 static void kron_pack(uint32_t packed[KRON_PACK_WORDS],
                       const int32_t *coeffs, int ncoeffs) {
   memset(packed, 0, KRON_PACK_WORDS * 4);
@@ -312,27 +315,44 @@ static void kron_mmm_setup(void) {
   rsaPKEWriteMc(mc);
 }
 
-/* Reverse byte order of a buffer in-place (for LE ↔ BE conversion). */
-static void reverse_bytes(uint8_t *buf, int len) {
-  for (int i = 0; i < len / 2; i++) {
-    uint8_t t = buf[i];
-    buf[i] = buf[len - 1 - i];
-    buf[len - 1 - i] = t;
+/* Convert a multi-word integer between host representation and PKE
+ * register representation, in-place.
+ *
+ * Host representation: uint32_t words in native byte order, word[0] is
+ * the least significant (least-significant-word-first).
+ *
+ * PKE representation: bytes in big-endian order, i.e. the most
+ * significant byte at the lowest address (most-significant-word-first,
+ * each word stored big-endian).
+ *
+ * The transform is self-inverse: applying it twice restores the original. */
+static void host_to_pke(uint32_t *buf, int nwords) {
+  int i = 0, j = nwords - 1;
+  for (; i < j; i++, j--) {
+    uint32_t a = buf[i], b = buf[j];
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    buf[i] = __builtin_bswap32(b);
+    buf[j] = __builtin_bswap32(a);
+#else
+    buf[i] = b;
+    buf[j] = a;
+#endif
   }
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+  if (i == j)
+    buf[i] = __builtin_bswap32(buf[i]);
+#endif
 }
-
-/* Convert LE uint32 words to BE byte array for PKE register write,
- * or BE byte array from PKE register read back to LE uint32 words. */
-static void words_le_to_be(uint32_t *buf, int nwords) {
-  reverse_bytes((uint8_t *)buf, nwords * 4);
-}
+/* pke_to_host is the same operation (self-inverse). */
+#define pke_to_host(buf, nwords) host_to_pke((buf), (nwords))
 
 /* Multiply two packed big integers using hardware MMM.
  * Since N = 2^M - 1 and R = 2^M ≡ 1 (mod N), MonMul(a,b) = a*b mod N.
  * As long as a*b < N, we get exact a*b.
  *
- * PKE registers store data as big-endian bytes (mbedtls_mpi_read_binary).
- * Our packed arrays are little-endian uint32 words. We must convert. */
+ * PKE registers store big-endian multi-precision integers.
+ * Packed arrays use host uint32_t words in LSW-first order.
+ * host_to_pke / pke_to_host convert between the two. */
 /* Register layout for Kronecker big-int multiply (pkeLen=54, 216 bytes each):
  * Each operand spans ceil(216/64) = 4 register slots.
  * Reg  0- 3: modulus (set by kron_mmm_setup)
@@ -348,23 +368,23 @@ static void kron_bigint_mul(uint32_t result[KRON_PROD_WORDS],
                             const uint32_t b[KRON_PACK_WORDS]) {
   uint32_t tmp[KRON_PKE_LEN];
 
-  /* Write a to reg 36 (LE→BE, zero-padded) */
+  /* Write a to PKE reg (host → PKE, zero-padded) */
   memset(tmp, 0, KRON_PKE_LEN * 4);
   memcpy(tmp, a, KRON_PACK_WORDS * 4);
-  words_le_to_be(tmp, KRON_PKE_LEN);
+  host_to_pke(tmp, KRON_PKE_LEN);
   eccPKEWriteBuf(KRON_REG_A, tmp, KRON_PKE_LEN);
 
-  /* Write b to reg 40 (LE→BE, zero-padded) */
+  /* Write b to PKE reg (host → PKE, zero-padded) */
   memset(tmp, 0, KRON_PKE_LEN * 4);
   memcpy(tmp, b, KRON_PACK_WORDS * 4);
-  words_le_to_be(tmp, KRON_PKE_LEN);
+  host_to_pke(tmp, KRON_PKE_LEN);
   eccPKEWriteBuf(KRON_REG_B, tmp, KRON_PKE_LEN);
 
   sm2MonMul(KRON_REG_R, KRON_REG_A, KRON_REG_B);
 
-  /* Read result and convert BE→LE */
+  /* Read result and convert PKE → host */
   eccPKEReadBuf(tmp, KRON_REG_R, KRON_PKE_LEN);
-  words_le_to_be(tmp, KRON_PKE_LEN);
+  pke_to_host(tmp, KRON_PKE_LEN);
   memcpy(result, tmp, KRON_PROD_WORDS * 4);
 }
 
