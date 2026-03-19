@@ -278,6 +278,20 @@ static void kron_unpack(int64_t *coeffs, int ncoeffs,
   }
 }
 
+/* Unpack a single coefficient at index k from a product big integer. */
+static int64_t kron_unpack_one(int k, const uint32_t prod[KRON_PROD_WORDS]) {
+  uint64_t mask = ((uint64_t)1 << KRON_L) - 1;
+  int bit_pos = k * KRON_L;
+  int word = bit_pos / 32;
+  int shift = bit_pos % 32;
+  uint64_t val = (uint64_t)prod[word] >> shift;
+  if (shift + KRON_L > 32 && word + 1 < KRON_PROD_WORDS)
+    val |= (uint64_t)prod[word + 1] << (32 - shift);
+  if (shift + KRON_L > 64 && word + 2 < KRON_PROD_WORDS)
+    val |= (uint64_t)prod[word + 2] << (64 - shift);
+  return (int64_t)(val & mask);
+}
+
 /* Big-integer MMM setup for Kronecker multiplication.
  * Uses modulus N = 2^M - 1 (Mersenne-like) so R ≡ 1 (mod N),
  * making MonMul(a,b) = a*b mod N = a*b when a*b < N. */
@@ -409,6 +423,46 @@ static void poly_mul_acc(int32_t c[N], const int32_t a[N], const int32_t b[N]) {
     v %= Q;
     if (v < 0) v += Q;
     c[i] = v;
+  }
+}
+
+/* Multiply challenge (in PKE_SLOT0) by polynomial b in Z_q[X]/(X^N+1).
+ * Challenge c is read from PKE registers — no stack poly needed for it.
+ * Accumulates into int32_t result with per-step mod Q (no int64_t acc[N]).
+ * b must have coefficients in [0, Q). Result in [0, Q). */
+static void poly_mul_challenge(int32_t result[N], const int32_t b[N]) {
+  int32_t a_chunk[KRON_G];               /* 64 bytes: challenge group */
+  uint32_t a_packed[KRON_PACK_WORDS];
+  uint32_t b_packed[KRON_PACK_WORDS];
+  uint32_t prod[KRON_PROD_WORDS];
+
+  memset(result, 0, N * sizeof(int32_t));
+  kron_mmm_setup();
+
+  for (int gi = 0; gi < KRON_T; gi++) {
+    eccPKEReadBuf((uint32_t *)a_chunk, PKE_SLOT0 + gi, KRON_G);
+    kron_pack(a_packed, a_chunk, KRON_G);
+
+    for (int gj = 0; gj < KRON_T; gj++) {
+      kron_pack(b_packed, &b[gj * KRON_G], KRON_G);
+      kron_bigint_mul(prod, a_packed, b_packed);
+
+      int base = (gi + gj) * KRON_G;
+      for (int k = 0; k < 2 * KRON_G - 1; k++) {
+        int64_t coeff = kron_unpack_one(k, prod);
+        int idx = base + k;
+        int64_t v;
+        if (idx < N) {
+          v = (int64_t)result[idx] + coeff;
+        } else {
+          idx -= N;
+          v = (int64_t)result[idx] - coeff;
+        }
+        v %= Q;
+        if (v < 0) v += Q;
+        result[idx] = (int32_t)v;
+      }
+    }
   }
 }
 
@@ -696,24 +750,46 @@ static const uint8_t *sk_t0(const uint8_t *sk, int i) {
 /* ------------------------------------------------------------------ */
 /*  Compute w_hat[i] = sum_j A_hat[i][j] * y_hat[j]                   */
 /*  One row at a time. y is re-expanded for each row.                  */
-/*  Uses poly0 for y_hat_j, poly1 for A_hat_ij, result in w_hat.      */
-/*  w_hat is accumulated in PKE_SLOT1 to free stack poly buffers.      */
+/*  Uses poly0 for y_hat_j, poly1 for A_hat_ij.                       */
+/*  w_hat is accumulated in PKE_SLOT1 (no stack poly needed).          */
+/*  Caller retrieves result via pke_load_poly(dst, PKE_SLOT1).         */
 /* ------------------------------------------------------------------ */
 
-static void compute_w_hat_row(int32_t w_hat[N],
-                              const uint8_t *rho,
+/* Pointwise accumulate into PKE_SLOT1: w_hat += a * b (NTT domain).
+ * Reads/writes w_hat from PKE_SLOT1 in 16-coeff chunks.
+ * Only touches regs 0-3 (MMM) and 20-35 (PKE_SLOT1). */
+static void pointwise_acc_pke(const int32_t a[N], const int32_t b[N]) {
+  pke_mmm_setup();
+  int32_t w_chunk[PKE_COEFFS_PER_REG];
+  for (int r = 0; r < N / PKE_COEFFS_PER_REG; r++) {
+    eccPKEReadBuf((uint32_t *)w_chunk, PKE_SLOT1 + r, PKE_COEFFS_PER_REG);
+    for (int k = 0; k < PKE_COEFFS_PER_REG; k++)
+      w_chunk[k] += hw_mon_mul(a[r * PKE_COEFFS_PER_REG + k],
+                                b[r * PKE_COEFFS_PER_REG + k]);
+    eccPKEWriteBuf(PKE_SLOT1 + r, (const uint32_t *)w_chunk,
+                   PKE_COEFFS_PER_REG);
+  }
+}
+
+static void compute_w_hat_row(const uint8_t *rho,
                               const uint8_t *rho_prime,
                               uint16_t kappa, int row,
                               int32_t poly0[N], int32_t poly1[N]) {
-  memset(w_hat, 0, N * sizeof(int32_t));
+  /* Zero PKE_SLOT1 (w_hat accumulator) */
+  {
+    uint32_t zeros[PKE_COEFFS_PER_REG];
+    memset(zeros, 0, sizeof(zeros));
+    for (int r = 0; r < N / PKE_COEFFS_PER_REG; r++)
+      eccPKEWriteBuf(PKE_SLOT1 + r, zeros, PKE_COEFFS_PER_REG);
+  }
   for (int j = 0; j < L; j++) {
     /* Expand y_j and NTT */
     poly_expand_mask(poly0, rho_prime, kappa + (uint16_t)j);
     ntt(poly0);
     /* Expand A[row][j] (already in NTT domain) */
     poly_rej_ntt(poly1, rho, (uint8_t)row, (uint8_t)j);
-    /* w_hat += A_ij * y_hat_j */
-    poly_pointwise_acc(w_hat, poly1, poly0);
+    /* w_hat += A_ij * y_hat_j (accumulated in PKE_SLOT1) */
+    pointwise_acc_pke(poly1, poly0);
   }
 }
 
@@ -732,7 +808,7 @@ int ml_dsa_65_sign(uint8_t *sig, size_t *sig_len,
                    const uint8_t *ctx, size_t ctx_len,
                    const uint8_t *sk) {
   /* ---- Stack-allocated working memory ---- */
-  poly poly0, poly1, poly2;             /* 3 × 1024 = 3072 bytes */
+  poly poly0, poly1;                     /* 2 × 1024 = 2048 bytes */
   SHA3_CTX_T shake_ctx;                 /* ~208 bytes */
   uint8_t mu[64];
   uint8_t rho_prime[64];
@@ -740,7 +816,9 @@ int ml_dsa_65_sign(uint8_t *sig, size_t *sig_len,
   uint8_t w1_packed[MLDSA_POLYW1_PACKEDBYTES]; /* 128 bytes */
   uint16_t kappa;
   int reject;
-  /* Total stack ≈ 3072 + 208 + 64 + 64 + 48 + 128 + misc ≈ 3.6 KB */
+  /* PKE_SLOT0 (regs 4-19):  challenge c (persistent across passes)
+   * PKE_SLOT1 (regs 20-35): w_hat accumulator / temp storage
+   * Total stack ≈ 2048 + 208 + 64 + 64 + 48 + 128 + misc ≈ 2.6 KB */
 
   if (ctx_len > 255) return -1;
 
@@ -781,16 +859,16 @@ int ml_dsa_65_sign(uint8_t *sig, size_t *sig_len,
     shake_update(&shake_ctx, mu, 64);
 
     for (int i = 0; i < K; i++) {
-      /* Compute w_hat[i] in poly2, using poly0/poly1 as scratch */
-      compute_w_hat_row(poly2, sk_rho(sk), rho_prime, kappa, i,
-                        poly0, poly1);
-      /* INTT to get w[i] in normal domain */
-      invntt(poly2);
-      poly_caddq(poly2);
+      /* Compute w_hat[i] → PKE_SLOT1, using poly0/poly1 as scratch */
+      compute_w_hat_row(sk_rho(sk), rho_prime, kappa, i, poly0, poly1);
+      /* Load w_hat from PKE_SLOT1, INTT to get w[i] */
+      pke_load_poly(poly0, PKE_SLOT1);
+      invntt(poly0);
+      poly_caddq(poly0);
       /* Extract w1 = HighBits(w[i]) and encode */
       for (int n = 0; n < N; n++)
-        poly0[n] = high_bits(poly2[n]);
-      pack_w1(w1_packed, poly0);
+        poly1[n] = high_bits(poly0[n]);
+      pack_w1(w1_packed, poly1);
       shake_update(&shake_ctx, w1_packed, MLDSA_POLYW1_PACKEDBYTES);
     }
 
@@ -806,15 +884,18 @@ int ml_dsa_65_sign(uint8_t *sig, size_t *sig_len,
     /* ==== Pass 2: Compute z = y + c*s1, check bounds ==== */
     /* Also encode z into signature as we go. */
     for (int j = 0; j < L; j++) {
-      /* y_j */
+      /* y_j → poly0, save to PKE_SLOT1 */
       poly_expand_mask(poly0, rho_prime, kappa + (uint16_t)j);
-      /* c * s1_j (both normal domain, via Kronecker) */
-      unpack_eta(poly1, sk_s1(sk, j));
-      poly_caddq(poly1);  /* ensure [0, Q) */
-      pke_load_poly(poly2, PKE_SLOT0); /* c (normal domain) */
-      poly_mul(poly2, poly2, poly1);
+      pke_store_poly(PKE_SLOT1, poly0);
+      /* s1_j → poly0 */
+      unpack_eta(poly0, sk_s1(sk, j));
+      poly_caddq(poly0);  /* ensure [0, Q) */
+      /* poly1 = c * s1_j (c read from PKE_SLOT0 inside) */
+      poly_mul_challenge(poly1, poly0);
+      /* Restore y_j from PKE_SLOT1 */
+      pke_load_poly(poly0, PKE_SLOT1);
       /* z_j = y_j + c*s1_j */
-      poly_add(poly0, poly0, poly2);
+      poly_add(poly0, poly0, poly1);
       poly_reduce(poly0);
       /* Center and check ||z_j||∞ >= gamma1 - beta → reject */
       for (int n = 0; n < N; n++) {
@@ -839,26 +920,29 @@ int ml_dsa_65_sign(uint8_t *sig, size_t *sig_len,
       memset(hint_buf, 0, OMEGA + K);
 
       for (int i = 0; i < K; i++) {
-        /* Recompute w[i] */
-        compute_w_hat_row(poly2, sk_rho(sk), rho_prime, kappa, i,
-                          poly0, poly1);
-        invntt(poly2);
-        poly_caddq(poly2);
-        /* poly2 = w[i] */
+        /* Recompute w[i] → PKE_SLOT1 */
+        compute_w_hat_row(sk_rho(sk), rho_prime, kappa, i, poly0, poly1);
+        pke_load_poly(poly0, PKE_SLOT1);
+        invntt(poly0);
+        poly_caddq(poly0);
+        /* poly0 = w[i], save to PKE_SLOT1 for later */
+        pke_store_poly(PKE_SLOT1, poly0);
 
-        /* Compute c*s2[i] (Kronecker, normal domain) */
+        /* Compute c*s2[i]: s2 → poly0, result → poly1 */
         unpack_eta(poly0, sk_s2(sk, i));
         poly_caddq(poly0);  /* ensure [0, Q) */
-        pke_load_poly(poly1, PKE_SLOT0); /* c (normal domain) */
-        poly_mul(poly0, poly1, poly0);
-        /* poly0 = c*s2[i] */
+        poly_mul_challenge(poly1, poly0);
+        /* poly1 = c*s2[i] */
 
-        /* r = w[i] - c*s2[i] */
-        poly_sub(poly1, poly2, poly0);
-        poly_reduce(poly1);
+        /* Restore w[i], compute r = w[i] - c*s2[i] */
+        pke_load_poly(poly0, PKE_SLOT1);
+        poly_sub(poly0, poly0, poly1);
+        poly_reduce(poly0);
+        /* poly0 = r = w[i] - c*s2[i] */
+
         /* Check ||LowBits(r)||∞ >= gamma2 - beta → reject */
         for (int n = 0; n < N; n++) {
-          int32_t r0 = low_bits(poly1[n]);
+          int32_t r0 = low_bits(poly0[n]);
           if (r0 >= (int32_t)(GAMMA2 - BETA_B) ||
               r0 <= -(int32_t)(GAMMA2 - BETA_B)) {
             reject = 1;
@@ -867,18 +951,18 @@ int ml_dsa_65_sign(uint8_t *sig, size_t *sig_len,
         }
         if (reject) break;
 
-        /* Compute c*t0[i] — save poly1 (w-cs2) to PKE slot 1 temporarily */
-        pke_store_poly(PKE_SLOT1, poly1);
+        /* Save r = w-cs2 to PKE_SLOT1, compute c*t0[i] */
+        pke_store_poly(PKE_SLOT1, poly0);
         unpack_t0(poly0, sk_t0(sk, i));
         poly_caddq(poly0);  /* ensure [0, Q) */
-        pke_load_poly(poly1, PKE_SLOT0); /* c (normal domain) */
-        poly_mul(poly0, poly1, poly0);
-        /* poly0 = c*t0[i], already reduced mod Q */
-        /* Restore poly1 = w - cs2 */
-        pke_load_poly(poly1, PKE_SLOT1);
+        poly_mul_challenge(poly1, poly0);
+        /* poly1 = c*t0[i] */
+        /* Restore r = w - cs2 */
+        pke_load_poly(poly0, PKE_SLOT1);
+
         /* Check ||c*t0||∞ < gamma2 */
         for (int n = 0; n < N; n++) {
-          int32_t v = poly0[n];
+          int32_t v = poly1[n];
           if (v > Q / 2) v -= Q;
           if (v >= (int32_t)GAMMA2 || v <= -(int32_t)GAMMA2) {
             reject = 1;
@@ -888,10 +972,10 @@ int ml_dsa_65_sign(uint8_t *sig, size_t *sig_len,
         if (reject) break;
 
         /* Make hint: h[i] = MakeHint(-ct0, w - cs2 + ct0) */
-        /* poly1 = w - cs2 (already computed), poly0 = ct0 */
+        /* poly0 = w - cs2, poly1 = ct0 */
         for (int n = 0; n < N; n++) {
-          int32_t neg_ct0 = freeze(-poly0[n]);
-          int32_t w_cs2_ct0 = freeze(poly1[n] + poly0[n]);
+          int32_t neg_ct0 = freeze(-poly1[n]);
+          int32_t w_cs2_ct0 = freeze(poly0[n] + poly1[n]);
           if (make_hint(neg_ct0, w_cs2_ct0)) {
             if (hint_count >= OMEGA) { reject = 1; break; }
             hint_buf[hint_count++] = (uint8_t)n;
