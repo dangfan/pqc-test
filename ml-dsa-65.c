@@ -25,6 +25,14 @@
 #define QINV     58728449u        /* Q^{-1} mod 2^32 */
 #define INTT_F   41978            /* R^2 * 256^{-1} mod Q  (compensates R^{-1} from pointwise) */
 
+/* Kronecker substitution parameters */
+#define KRON_G       16    /* coefficients per group */
+#define KRON_T       16    /* number of groups (N / KRON_G) */
+#define KRON_L       50    /* bits per packed coefficient */
+#define KRON_PACK_WORDS  25  /* ceil(KRON_G * KRON_L / 32) = 800/32 */
+#define KRON_PROD_WORDS  50  /* ceil((2*KRON_G - 1) * KRON_L / 32) ≈ 1550/32 */
+#define KRON_PKE_LEN     54  /* pkeLen in 4-byte words for big-int multiply (>= KRON_PROD_WORDS + margin) */
+
 typedef int32_t poly[N];
 
 /* PKE register helpers: 16 int32 coefficients per 64-byte register */
@@ -97,28 +105,61 @@ static void pke_load_poly(int32_t p[N], int base_reg) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Hardware MMM setup for Q                                           */
+/*  Hardware MMM setup for Q (scalar, pkeLen=2)                        */
+/*  PKE registers use big-endian byte order.                           */
 /* ------------------------------------------------------------------ */
 
+/* Write 32-bit value into upper half of 8-byte BE register (value * 2^32). */
+static void write_be32_hi(int reg_idx, uint32_t val) {
+  uint8_t buf[8] = {0};
+  buf[0] = (uint8_t)(val >> 24);
+  buf[1] = (uint8_t)(val >> 16);
+  buf[2] = (uint8_t)(val >>  8);
+  buf[3] = (uint8_t)(val      );
+  eccPKEWriteBuf(reg_idx, (const uint32_t *)buf, 2);
+}
+
+/* Write 32-bit value into lower half of 8-byte BE register. */
+static void write_be32_lo(int reg_idx, uint32_t val) {
+  uint8_t buf[8] = {0};
+  buf[4] = (uint8_t)(val >> 24);
+  buf[5] = (uint8_t)(val >> 16);
+  buf[6] = (uint8_t)(val >>  8);
+  buf[7] = (uint8_t)(val      );
+  eccPKEWriteBuf(reg_idx, (const uint32_t *)buf, 2);
+}
+
+/* Read 32-bit value from lower half of 8-byte BE register. */
+static uint32_t read_be32_lo(int reg_idx) {
+  uint8_t buf[8];
+  eccPKEReadBuf((uint32_t *)buf, reg_idx, 2);
+  return ((uint32_t)buf[4] << 24) | ((uint32_t)buf[5] << 16) |
+         ((uint32_t)buf[6] <<  8) | ((uint32_t)buf[7]);
+}
+
 static void pke_mmm_setup(void) {
-  uint32_t mod = Q;
-  rsaPKESetLen(1);
-  eccPKEWriteBuf(0, &mod, 1);            /* reg 0 = Q */
+  rsaPKESetLen(2);
+  write_be32_lo(0, Q);                   /* reg 0 = Q (big-endian, lower half) */
+  uint8_t mod_buf[8] = {0};
+  mod_buf[4] = (uint8_t)(Q >> 24);
+  mod_buf[5] = (uint8_t)(Q >> 16);
+  mod_buf[6] = (uint8_t)(Q >>  8);
+  mod_buf[7] = (uint8_t)(Q      );
   uint32_t mc[2];
-  eccCalMc64(mc, &mod);
+  eccCalMc64(mc, (const uint32_t *)mod_buf);
   rsaPKEWriteMc(mc);
 }
 
-/* Hardware modular multiply: a * b * R^{-1} mod Q */
+/* Hardware modular multiply: a * b * R_32^{-1} mod Q, where R_32 = 2^32.
+ * With pkeLen=2, hardware R = 2^64. We store operand a in the UPPER half
+ * (value = a * 2^32) and b in the LOWER half (value = b), so:
+ *   MonMul(a*2^32, b) = a*2^32 * b * 2^{-64} mod Q = a * b * 2^{-32} mod Q
+ * This matches the original R=2^32 Montgomery behavior. */
 static int32_t hw_mon_mul(int32_t a, int32_t b) {
-  uint32_t ua = (uint32_t)freeze(a);
-  uint32_t ub = (uint32_t)freeze(b);
-  uint32_t result;
-  eccPKEWriteBuf(1, &ua, 1);
-  eccPKEWriteBuf(2, &ub, 1);
+  write_be32_hi(1, (uint32_t)freeze(a));
+  write_be32_lo(2, (uint32_t)freeze(b));
   sm2MonMul(3, 1, 2);
-  eccPKEReadBuf(&result, 3, 1);
-  return (int32_t)result;
+  return (int32_t)read_be32_lo(3);
 }
 
 /* ------------------------------------------------------------------ */
@@ -184,6 +225,191 @@ static void poly_pointwise_acc(int32_t c[N], const int32_t a[N],
   pke_mmm_setup();
   for (int i = 0; i < N; i++)
     c[i] += hw_mon_mul(a[i], b[i]);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Kronecker substitution polynomial multiplication                    */
+/*                                                                      */
+/*  Replaces NTT + pointwise + INTT with direct polynomial multiply     */
+/*  in Z_q[X]/(X^N+1) using Kronecker packing and hardware big-int MMM. */
+/*                                                                      */
+/*  Strategy:                                                           */
+/*    - Split each poly into KRON_T=16 groups of KRON_G=16 coefficients */
+/*    - For each pair of groups (i,j), pack coefficients at KRON_L=50   */
+/*      bits each into ~800-bit integers, do ONE hardware multiply,     */
+/*      unpack the 31-coefficient sub-product.                          */
+/*    - Accumulate sub-products into result, reducing mod X^N+1.        */
+/*    - Total: 256 HW multiplies (vs ~2304 in NTT approach).           */
+/* ------------------------------------------------------------------ */
+
+/* Pack KRON_G non-negative coefficients into a big integer.
+ * Each coefficient occupies KRON_L bits. Packed little-endian by bit. */
+static void kron_pack(uint32_t packed[KRON_PACK_WORDS],
+                      const int32_t *coeffs, int ncoeffs) {
+  memset(packed, 0, KRON_PACK_WORDS * 4);
+  for (int i = 0; i < ncoeffs; i++) {
+    uint64_t val = (uint64_t)(uint32_t)coeffs[i];  /* non-negative */
+    int bit_pos = i * KRON_L;
+    int word = bit_pos / 32;
+    int shift = bit_pos % 32;
+    packed[word] |= (uint32_t)(val << shift);
+    if (shift + KRON_L > 32 && word + 1 < KRON_PACK_WORDS)
+      packed[word + 1] |= (uint32_t)(val >> (32 - shift));
+    if (shift + KRON_L > 64 && word + 2 < KRON_PACK_WORDS)
+      packed[word + 2] |= (uint32_t)(val >> (64 - shift));
+  }
+}
+
+/* Unpack (2*KRON_G - 1) coefficients from a product big integer.
+ * Each coefficient is at KRON_L-bit stride. Coefficients fit in 50 bits. */
+static void kron_unpack(int64_t *coeffs, int ncoeffs,
+                        const uint32_t prod[KRON_PROD_WORDS]) {
+  uint64_t mask = ((uint64_t)1 << KRON_L) - 1;
+  for (int i = 0; i < ncoeffs; i++) {
+    int bit_pos = i * KRON_L;
+    int word = bit_pos / 32;
+    int shift = bit_pos % 32;
+    uint64_t val = (uint64_t)prod[word] >> shift;
+    if (shift + KRON_L > 32 && word + 1 < KRON_PROD_WORDS)
+      val |= (uint64_t)prod[word + 1] << (32 - shift);
+    if (shift + KRON_L > 64 && word + 2 < KRON_PROD_WORDS)
+      val |= (uint64_t)prod[word + 2] << (64 - shift);
+    coeffs[i] = (int64_t)(val & mask);
+  }
+}
+
+/* Big-integer MMM setup for Kronecker multiplication.
+ * Uses modulus N = 2^M - 1 (Mersenne-like) so R ≡ 1 (mod N),
+ * making MonMul(a,b) = a*b mod N = a*b when a*b < N. */
+static void kron_mmm_setup(void) {
+  rsaPKESetLen(KRON_PKE_LEN);
+
+  /* Set modulus N = 2^(KRON_PKE_LEN*32) - 1 (all ones, odd).
+   * With N = 2^M - 1 where M = KRON_PKE_LEN*32:
+   *   R = 2^M ≡ 1 (mod N), so R^{-1} ≡ 1 (mod N).
+   *   MonMul(a, b) = a * b * R^{-1} mod N = a * b mod N.
+   * As long as a*b < N, we get exact a*b. No R compensation needed. */
+  uint32_t mod[KRON_PKE_LEN];
+  memset(mod, 0xFF, KRON_PKE_LEN * 4);
+  eccPKEWriteBuf(0, mod, KRON_PKE_LEN);
+
+  uint32_t mc[2];
+  eccCalMc64(mc, mod);
+  rsaPKEWriteMc(mc);
+}
+
+/* Reverse byte order of a buffer in-place (for LE ↔ BE conversion). */
+static void reverse_bytes(uint8_t *buf, int len) {
+  for (int i = 0; i < len / 2; i++) {
+    uint8_t t = buf[i];
+    buf[i] = buf[len - 1 - i];
+    buf[len - 1 - i] = t;
+  }
+}
+
+/* Convert LE uint32 words to BE byte array for PKE register write,
+ * or BE byte array from PKE register read back to LE uint32 words. */
+static void words_le_to_be(uint32_t *buf, int nwords) {
+  reverse_bytes((uint8_t *)buf, nwords * 4);
+}
+
+/* Multiply two packed big integers using hardware MMM.
+ * Since N = 2^M - 1 and R = 2^M ≡ 1 (mod N), MonMul(a,b) = a*b mod N.
+ * As long as a*b < N, we get exact a*b.
+ *
+ * PKE registers store data as big-endian bytes (mbedtls_mpi_read_binary).
+ * Our packed arrays are little-endian uint32 words. We must convert. */
+/* Register layout for Kronecker big-int multiply (pkeLen=54, 216 bytes each):
+ * Each operand spans ceil(216/64) = 4 register slots.
+ * Reg  0- 3: modulus (set by kron_mmm_setup)
+ * Reg 36-39: operand a    (avoids PKE_SLOT0=4-19, PKE_SLOT1=20-35)
+ * Reg 40-43: operand b
+ * Reg 44-47: result */
+#define KRON_REG_A  36
+#define KRON_REG_B  40
+#define KRON_REG_R  44
+
+static void kron_bigint_mul(uint32_t result[KRON_PROD_WORDS],
+                            const uint32_t a[KRON_PACK_WORDS],
+                            const uint32_t b[KRON_PACK_WORDS]) {
+  uint32_t tmp[KRON_PKE_LEN];
+
+  /* Write a to reg 36 (LE→BE, zero-padded) */
+  memset(tmp, 0, KRON_PKE_LEN * 4);
+  memcpy(tmp, a, KRON_PACK_WORDS * 4);
+  words_le_to_be(tmp, KRON_PKE_LEN);
+  eccPKEWriteBuf(KRON_REG_A, tmp, KRON_PKE_LEN);
+
+  /* Write b to reg 40 (LE→BE, zero-padded) */
+  memset(tmp, 0, KRON_PKE_LEN * 4);
+  memcpy(tmp, b, KRON_PACK_WORDS * 4);
+  words_le_to_be(tmp, KRON_PKE_LEN);
+  eccPKEWriteBuf(KRON_REG_B, tmp, KRON_PKE_LEN);
+
+  sm2MonMul(KRON_REG_R, KRON_REG_A, KRON_REG_B);
+
+  /* Read result and convert BE→LE */
+  eccPKEReadBuf(tmp, KRON_REG_R, KRON_PKE_LEN);
+  words_le_to_be(tmp, KRON_PKE_LEN);
+  memcpy(result, tmp, KRON_PROD_WORDS * 4);
+}
+
+/* Multiply two polynomials in Z_q[X]/(X^N+1) using Kronecker substitution.
+ * Both a and b must have coefficients in [0, Q). Result c has coefficients
+ * reduced mod Q in [0, Q). */
+static void poly_mul(int32_t c[N], const int32_t a[N], const int32_t b[N]) {
+  int64_t acc[N];  /* accumulator with inline negacyclic reduction, ~2 KB */
+  memset(acc, 0, sizeof(acc));
+
+  kron_mmm_setup();
+
+  /* Schoolbook on groups: for each pair (gi, gj), compute sub-product
+   * via Kronecker and accumulate with negacyclic folding (X^N = -1). */
+  for (int gi = 0; gi < KRON_T; gi++) {
+    const int32_t *a_seg = &a[gi * KRON_G];
+    uint32_t a_packed[KRON_PACK_WORDS];
+    kron_pack(a_packed, a_seg, KRON_G);
+
+    for (int gj = 0; gj < KRON_T; gj++) {
+      const int32_t *b_seg = &b[gj * KRON_G];
+      uint32_t b_packed[KRON_PACK_WORDS];
+      kron_pack(b_packed, b_seg, KRON_G);
+
+      uint32_t prod[KRON_PROD_WORDS];
+      kron_bigint_mul(prod, a_packed, b_packed);
+
+      int64_t sub_coeffs[2 * KRON_G - 1];
+      kron_unpack(sub_coeffs, 2 * KRON_G - 1, prod);
+
+      int base = (gi + gj) * KRON_G;
+      for (int k = 0; k < 2 * KRON_G - 1; k++) {
+        int idx = base + k;
+        if (idx < N)
+          acc[idx] += sub_coeffs[k];
+        else
+          acc[idx - N] -= sub_coeffs[k];  /* X^N = -1 */
+      }
+    }
+  }
+
+  /* Reduce mod Q */
+  for (int i = 0; i < N; i++) {
+    int64_t v = acc[i] % Q;
+    if (v < 0) v += Q;
+    c[i] = (int32_t)v;
+  }
+}
+
+/* Multiply and accumulate: c += a * b mod (X^N+1, Q) */
+static void poly_mul_acc(int32_t c[N], const int32_t a[N], const int32_t b[N]) {
+  poly tmp;
+  poly_mul(tmp, a, b);
+  for (int i = 0; i < N; i++) {
+    int32_t v = c[i] + tmp[i];
+    v %= Q;
+    if (v < 0) v += Q;
+    c[i] = v;
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -571,10 +797,10 @@ int ml_dsa_65_sign(uint8_t *sig, size_t *sig_len,
     shake_finalize(&shake_ctx);
     shake_squeeze(&shake_ctx, c_tilde, MLDSA_C_TILDE_BYTES);
 
-    /* ==== Compute challenge c and NTT(c) ==== */
+    /* ==== Compute challenge c ==== */
     poly_challenge(poly0, c_tilde);
-    ntt(poly0);
-    /* Store c_hat in PKE slot 0 (regs 4-19) */
+    poly_caddq(poly0);  /* ensure [0, Q) for Kronecker packing */
+    /* Store c in PKE slot 0 (normal domain, regs 4-19) */
     pke_store_poly(PKE_SLOT0, poly0);
 
     /* ==== Pass 2: Compute z = y + c*s1, check bounds ==== */
@@ -582,13 +808,12 @@ int ml_dsa_65_sign(uint8_t *sig, size_t *sig_len,
     for (int j = 0; j < L; j++) {
       /* y_j */
       poly_expand_mask(poly0, rho_prime, kappa + (uint16_t)j);
-      /* c_hat * NTT(s1_j) */
+      /* c * s1_j (both normal domain, via Kronecker) */
       unpack_eta(poly1, sk_s1(sk, j));
-      ntt(poly1);
-      pke_load_poly(poly2, PKE_SLOT0); /* c_hat */
-      poly_pointwise(poly2, poly2, poly1);
-      invntt(poly2);
-      /* z_j = y_j + INTT(c_hat * s1_hat_j) */
+      poly_caddq(poly1);  /* ensure [0, Q) */
+      pke_load_poly(poly2, PKE_SLOT0); /* c (normal domain) */
+      poly_mul(poly2, poly2, poly1);
+      /* z_j = y_j + c*s1_j */
       poly_add(poly0, poly0, poly2);
       poly_reduce(poly0);
       /* Center and check ||z_j||∞ >= gamma1 - beta → reject */
@@ -621,12 +846,11 @@ int ml_dsa_65_sign(uint8_t *sig, size_t *sig_len,
         poly_caddq(poly2);
         /* poly2 = w[i] */
 
-        /* Compute c*s2[i] */
+        /* Compute c*s2[i] (Kronecker, normal domain) */
         unpack_eta(poly0, sk_s2(sk, i));
-        ntt(poly0);
-        pke_load_poly(poly1, PKE_SLOT0); /* c_hat */
-        poly_pointwise(poly0, poly1, poly0);
-        invntt(poly0);
+        poly_caddq(poly0);  /* ensure [0, Q) */
+        pke_load_poly(poly1, PKE_SLOT0); /* c (normal domain) */
+        poly_mul(poly0, poly1, poly0);
         /* poly0 = c*s2[i] */
 
         /* r = w[i] - c*s2[i] */
@@ -646,11 +870,10 @@ int ml_dsa_65_sign(uint8_t *sig, size_t *sig_len,
         /* Compute c*t0[i] — save poly1 (w-cs2) to PKE slot 1 temporarily */
         pke_store_poly(PKE_SLOT1, poly1);
         unpack_t0(poly0, sk_t0(sk, i));
-        ntt(poly0);
-        pke_load_poly(poly1, PKE_SLOT0); /* c_hat */
-        poly_pointwise(poly0, poly1, poly0);
-        invntt(poly0);
-        poly_reduce(poly0);
+        poly_caddq(poly0);  /* ensure [0, Q) */
+        pke_load_poly(poly1, PKE_SLOT0); /* c (normal domain) */
+        poly_mul(poly0, poly1, poly0);
+        /* poly0 = c*t0[i], already reduced mod Q */
         /* Restore poly1 = w - cs2 */
         pke_load_poly(poly1, PKE_SLOT1);
         /* Check ||c*t0||∞ < gamma2 */
@@ -877,10 +1100,10 @@ int ml_dsa_65_verify(const uint8_t *msg, size_t msg_len,
     shake_squeeze(&shake_ctx, mu, 64);
   }
 
-  /* Compute c = SampleInBall(c_tilde) and NTT(c) */
+  /* Compute c = SampleInBall(c_tilde) */
   poly_challenge(poly0, c_tilde);
-  ntt(poly0);
-  /* Store c_hat in PKE slot 0 */
+  poly_caddq(poly0);  /* ensure [0, Q) for Kronecker packing */
+  /* Store c in PKE slot 0 (normal domain) */
   pke_store_poly(PKE_SLOT0, poly0);
 
   /* Compute w'_approx and hash w1' */
@@ -888,9 +1111,9 @@ int ml_dsa_65_verify(const uint8_t *msg, size_t msg_len,
   shake_update(&shake_ctx, mu, 64);
 
   for (int i = 0; i < K; i++) {
-    /* w'_approx[i] = NTT^{-1}(A_hat[i] * z_hat - c_hat * NTT(t1[i] << D)) */
+    /* w'_approx[i] = A[i]*z - c*(t1[i] << D) */
 
-    /* Compute sum_j A_hat[i][j] * z_hat[j] */
+    /* Compute sum_j A_hat[i][j] * z_hat[j] in NTT domain, then INTT */
     memset(poly2, 0, N * sizeof(int32_t));
     for (int j = 0; j < L; j++) {
       unpack_z(poly0, z_bytes + j * MLDSA_POLYZ_PACKEDBYTES);
@@ -898,18 +1121,21 @@ int ml_dsa_65_verify(const uint8_t *msg, size_t msg_len,
       poly_rej_ntt(poly1, rho, (uint8_t)i, (uint8_t)j);
       poly_pointwise_acc(poly2, poly1, poly0);
     }
+    invntt(poly2);
+    poly_caddq(poly2);
+    /* poly2 = A[i]*z in normal domain */
 
-    /* Compute c_hat * NTT(t1[i] << D) */
+    /* Compute c * (t1[i] << D) via Kronecker (normal domain) */
     unpack_t1(poly0, pk + 32 + i * MLDSA_POLYT1_PACKEDBYTES);
     for (int n = 0; n < N; n++)
       poly0[n] <<= D_BITS;
-    ntt(poly0);
-    pke_load_poly(poly1, PKE_SLOT0); /* c_hat */
-    poly_pointwise(poly0, poly1, poly0);
+    poly_reduce(poly0);
+    pke_load_poly(poly1, PKE_SLOT0); /* c (normal domain) */
+    poly_mul(poly0, poly1, poly0);
 
-    /* w'_approx = Az_hat - ct1_hat */
+    /* w'_approx = Az - c*(t1<<D) */
     poly_sub(poly2, poly2, poly0);
-    invntt(poly2);
+    poly_reduce(poly2);
     poly_caddq(poly2);
 
     /* Apply hint to get w1' */

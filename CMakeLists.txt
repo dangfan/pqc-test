@@ -46,10 +46,34 @@ target_compile_definitions(mldsa-native-65 PRIVATE
     MLD_CONFIG_NAMESPACE_PREFIX=mldsa
 )
 
+# Find mbedtls (required by se_impl.c)
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+  pkg_check_modules(MBEDTLS QUIET mbedtls)
+endif()
+if(NOT MBEDTLS_FOUND)
+  find_path(MBEDTLS_INCLUDE_DIRS mbedtls/bignum.h
+    HINTS /opt/homebrew/include /opt/homebrew/anaconda3/include /usr/local/include /usr/include)
+  find_library(MBEDTLS_CRYPTO_LIB mbedcrypto
+    HINTS /opt/homebrew/lib /opt/homebrew/anaconda3/lib /usr/local/lib /usr/lib)
+  if(MBEDTLS_INCLUDE_DIRS AND MBEDTLS_CRYPTO_LIB)
+    set(MBEDTLS_FOUND TRUE)
+    set(MBEDTLS_LIBRARIES ${MBEDTLS_CRYPTO_LIB})
+  endif()
+endif()
+
 # ML-DSA-65 library
 add_library(ml-dsa-65 STATIC ml-dsa-65.c se_impl.c)
 target_include_directories(ml-dsa-65 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(ml-dsa-65 PUBLIC sha3)
+if(MBEDTLS_FOUND)
+  target_include_directories(ml-dsa-65 PRIVATE ${MBEDTLS_INCLUDE_DIRS})
+  target_link_libraries(ml-dsa-65 PRIVATE ${MBEDTLS_LIBRARIES})
+  # Set RPATH so runtime can find the shared library
+  get_filename_component(MBEDTLS_LIB_DIR "${MBEDTLS_CRYPTO_LIB}" DIRECTORY)
+  set(CMAKE_INSTALL_RPATH "${MBEDTLS_LIB_DIR}")
+  set(CMAKE_BUILD_RPATH "${MBEDTLS_LIB_DIR}")
+endif()
 
 # Test executable
 add_executable(test_ml_dsa

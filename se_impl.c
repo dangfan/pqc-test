@@ -1,103 +1,121 @@
-/*
- * Software implementation of se.h functions.
- * PKE registers backed by memory; Montgomery multiplication in software.
- */
-
 #include "se.h"
+#include <assert.h>
+#include <mbedtls/bignum.h>
 #include <string.h>
 
-/* 48 PKE registers, each 64 bytes = 16 uint32_t words */
-#define PKE_NUM_REGS  48
-#define PKE_REG_WORDS 16
-
-static uint32_t pke_regs[PKE_NUM_REGS][PKE_REG_WORDS];
-
-/* ---- No-op functions ---- */
+// count of uint32_t data
+static int pkeLen;
+static uint8_t reg[48][64];
+static mbedtls_mpi Rinv;
 
 int rsaPKESetLen(int len) {
-  (void)len;
+  assert(len % 2 == 0);
+  pkeLen = len;
+  assert(pkeLen <= 64);
   return 0;
 }
 
-int eccCalMc64(uint32_t *mc, const uint32_t *p) {
-  (void)mc;
-  (void)p;
-  return 0;
-}
+int eccCalMc64(uint32_t *mc, const uint32_t *p) { return 0; }
 
 int rsaPKEWriteMc(const uint32_t *buf) {
-  (void)buf;
+  mbedtls_mpi a, n;
+  mbedtls_mpi_init(&a);
+  mbedtls_mpi_init(&n);
+  mbedtls_mpi_init(&Rinv);
+
+  mbedtls_mpi_read_binary(&n, reg[0], pkeLen * 4);
+
+  uint8_t R[pkeLen * 4 + 1]; // R
+  memset(R, 0, pkeLen * 4 + 1);
+  R[0] = 1;
+  mbedtls_mpi_read_binary(&a, R, pkeLen * 4 + 1); // a = R
+
+  mbedtls_mpi_inv_mod(&Rinv, &a, &n);   // Rinv = a^-1 = R^-1
+
+  mbedtls_mpi_free(&a);
+  mbedtls_mpi_free(&n);
   return 0;
 }
 
-/* ---- PKE register read/write ---- */
-
 int eccPKEWriteBuf(int idx, const uint32_t *buf, int len) {
-  if (idx < 0 || idx >= PKE_NUM_REGS || len < 0 || len > PKE_REG_WORDS)
-    return -1;
-  memset(pke_regs[idx], 0, sizeof(pke_regs[idx]));
-  memcpy(pke_regs[idx], buf, (size_t)len * sizeof(uint32_t));
+  memcpy(reg[idx], buf, len * 4);
   return 0;
 }
 
 int eccPKEReadBuf(uint32_t *buf, int idx, int len) {
-  if (idx < 0 || idx >= PKE_NUM_REGS || len < 0 || len > PKE_REG_WORDS)
-    return -1;
-  memcpy(buf, pke_regs[idx], (size_t)len * sizeof(uint32_t));
+  memcpy(buf, reg[idx], len * 4);
   return 0;
 }
 
-/* ---- 32-bit Montgomery multiplication ---- */
+int sm2MonAdd(int r, int idxA, int idxB) {
+  mbedtls_mpi re, a, b, n;
+  mbedtls_mpi_init(&re);
+  mbedtls_mpi_init(&a);
+  mbedtls_mpi_init(&b);
+  mbedtls_mpi_init(&n);
 
-/* Cached Montgomery constant: -mod^{-1} mod 2^32 */
-static uint32_t cached_mod = 0;
-static uint32_t cached_neg_inv = 0;
+  mbedtls_mpi_read_binary(&n, reg[0], pkeLen * 4);
+  mbedtls_mpi_read_binary(&a, reg[idxA], pkeLen * 4);
+  mbedtls_mpi_read_binary(&b, reg[idxB], pkeLen * 4);
 
-/* Compute n^{-1} mod 2^32 using Newton's method (n must be odd) */
-static uint32_t mod_inv32(uint32_t n) {
-  uint32_t x = n;
-  for (int i = 0; i < 5; i++)
-    x *= 2 - n * x;
-  return x;
-}
+  mbedtls_mpi_add_mpi(&re, &a, &b);
+  mbedtls_mpi_mod_mpi(&re, &re, &n);
 
-static void ensure_mont_const(uint32_t mod) {
-  if (mod != cached_mod) {
-    cached_mod = mod;
-    cached_neg_inv = -(mod_inv32(mod));
-  }
-}
+  mbedtls_mpi_write_binary(&re, reg[r], pkeLen * 4);
 
-int sm2MonMul(int r, int a, int b) {
-  uint32_t mod = pke_regs[0][0];
-  ensure_mont_const(mod);
-  uint64_t t = (uint64_t)pke_regs[a][0] * pke_regs[b][0];
-  uint32_t m = (uint32_t)t * cached_neg_inv;
-  uint64_t u = t + (uint64_t)m * mod;
-  uint32_t result = (uint32_t)(u >> 32);
-  if (result >= mod) result -= mod;
-  pke_regs[r][0] = result;
+  mbedtls_mpi_free(&re);
+  mbedtls_mpi_free(&a);
+  mbedtls_mpi_free(&b);
+  mbedtls_mpi_free(&n);
+
   return 0;
 }
 
-/* ---- Modular add/sub ---- */
+int sm2MonSub(int r, int idxA, int idxB) {
+  mbedtls_mpi re, a, b, n;
+  mbedtls_mpi_init(&re);
+  mbedtls_mpi_init(&a);
+  mbedtls_mpi_init(&b);
+  mbedtls_mpi_init(&n);
 
-int sm2MonAdd(int r, int a, int b) {
-  (void)r;
-  (void)a;
-  (void)b;
+  mbedtls_mpi_read_binary(&n, reg[0], pkeLen * 4);
+  mbedtls_mpi_read_binary(&a, reg[idxA], pkeLen * 4);
+  mbedtls_mpi_read_binary(&b, reg[idxB], pkeLen * 4);
+
+  mbedtls_mpi_sub_mpi(&re, &a, &b);
+  mbedtls_mpi_mod_mpi(&re, &re, &n);
+
+  mbedtls_mpi_write_binary(&re, reg[r], pkeLen * 4);
+
+  mbedtls_mpi_free(&re);
+  mbedtls_mpi_free(&a);
+  mbedtls_mpi_free(&b);
+  mbedtls_mpi_free(&n);
+
   return 0;
 }
 
-int sm2MonSub(int r, int a, int b) {
-  (void)r;
-  (void)a;
-  (void)b;
+int sm2MonMul(int r, int idxA, int idxB) {
+  mbedtls_mpi re, a, b, n;
+  mbedtls_mpi_init(&re);
+  mbedtls_mpi_init(&a);
+  mbedtls_mpi_init(&b);
+  mbedtls_mpi_init(&n);
+
+  mbedtls_mpi_read_binary(&n, reg[0], pkeLen * 4);
+  mbedtls_mpi_read_binary(&a, reg[idxA], pkeLen * 4);
+  mbedtls_mpi_read_binary(&b, reg[idxB], pkeLen * 4);
+
+  mbedtls_mpi_mul_mpi(&re, &a, &b); // re = a * b
+  mbedtls_mpi_mul_mpi(&re, &re, &Rinv); // re = re * Rinv
+  mbedtls_mpi_mod_mpi(&re, &re, &n);
+
+  mbedtls_mpi_write_binary(&re, reg[r], pkeLen * 4);
+
+  mbedtls_mpi_free(&re);
+  mbedtls_mpi_free(&a);
+  mbedtls_mpi_free(&b);
+  mbedtls_mpi_free(&n);
+
   return 0;
 }
-
-/* ---- Stubs ---- */
-
-void self_test(void) {}
-void se_start(void) {}
-void se_stop(void) {}
