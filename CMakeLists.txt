@@ -2,7 +2,8 @@ cmake_minimum_required(VERSION 3.14)
 project(pqc-test C)
 
 set(CMAKE_C_STANDARD 11)
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -O2")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -O2 -ffunction-sections -fdata-sections")
+set(CMAKE_EXE_LINKER_FLAGS  "${CMAKE_EXE_LINKER_FLAGS} -Wl,--gc-sections")
 
 include(FetchContent)
 
@@ -11,22 +12,16 @@ FetchContent_Declare(
     canokey_crypto
     GIT_REPOSITORY https://github.com/canokeys/canokey-crypto.git
     GIT_TAG master
+    SOURCE_SUBDIR DO_NOT_RUN_CMAKE
 )
-FetchContent_GetProperties(canokey_crypto)
-if(NOT canokey_crypto_POPULATED)
-    FetchContent_Populate(canokey_crypto)
-endif()
-
 # Fetch mldsa-native reference implementation for cross-check testing
 FetchContent_Declare(
     mldsa_native
     GIT_REPOSITORY https://github.com/pq-code-package/mldsa-native.git
     GIT_TAG v1.0.0-alpha
+    SOURCE_SUBDIR DO_NOT_RUN_CMAKE
 )
-FetchContent_GetProperties(mldsa_native)
-if(NOT mldsa_native_POPULATED)
-    FetchContent_Populate(mldsa_native)
-endif()
+FetchContent_MakeAvailable(canokey_crypto mldsa_native)
 
 # Build only sha3.c (+ memzero.c dependency) from canokey-crypto
 add_library(sha3 STATIC
@@ -49,16 +44,22 @@ target_compile_definitions(mldsa-native-65 PRIVATE
 # Find mbedtls (required by se_impl.c)
 find_package(PkgConfig QUIET)
 if(PkgConfig_FOUND)
-  pkg_check_modules(MBEDTLS QUIET mbedtls)
+  pkg_check_modules(MBEDTLS mbedtls)
 endif()
-if(NOT MBEDTLS_FOUND)
+if(MBEDTLS_FOUND)
+  set(MBEDTLS_LIB ${MBEDTLS_STATIC_LIBRARIES})
+  message(STATUS "Using mbedtls from pkg-config: ${MBEDTLS_LIB}")
+else()
   find_path(MBEDTLS_INCLUDE_DIRS mbedtls/bignum.h
     HINTS /opt/homebrew/include /opt/homebrew/anaconda3/include /usr/local/include /usr/include)
   find_library(MBEDTLS_CRYPTO_LIB mbedcrypto
     HINTS /opt/homebrew/lib /opt/homebrew/anaconda3/lib /usr/local/lib /usr/lib)
   if(MBEDTLS_INCLUDE_DIRS AND MBEDTLS_CRYPTO_LIB)
+    message(STATUS "Using mbedtls from search path: ${MBEDTLS_CRYPTO_LIB}")
     set(MBEDTLS_FOUND TRUE)
-    set(MBEDTLS_LIBRARIES ${MBEDTLS_CRYPTO_LIB})
+    set(MBEDTLS_LIB ${MBEDTLS_CRYPTO_LIB})
+  else()
+    message(FATAL "mbedtls not found!")
   endif()
 endif()
 
@@ -66,14 +67,12 @@ endif()
 add_library(ml-dsa-65 STATIC ml-dsa-65.c se_impl.c)
 target_include_directories(ml-dsa-65 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(ml-dsa-65 PUBLIC sha3)
-if(MBEDTLS_FOUND)
-  target_include_directories(ml-dsa-65 PRIVATE ${MBEDTLS_INCLUDE_DIRS})
-  target_link_libraries(ml-dsa-65 PRIVATE ${MBEDTLS_LIBRARIES})
-  # Set RPATH so runtime can find the shared library
-  get_filename_component(MBEDTLS_LIB_DIR "${MBEDTLS_CRYPTO_LIB}" DIRECTORY)
-  set(CMAKE_INSTALL_RPATH "${MBEDTLS_LIB_DIR}")
-  set(CMAKE_BUILD_RPATH "${MBEDTLS_LIB_DIR}")
-endif()
+target_include_directories(ml-dsa-65 PRIVATE ${MBEDTLS_INCLUDE_DIRS})
+target_link_libraries(ml-dsa-65 PUBLIC ${MBEDTLS_LIB})
+# Set RPATH so runtime can find the shared library
+# get_filename_component(MBEDTLS_LIB_DIR "${MBEDTLS_CRYPTO_LIB}" DIRECTORY)
+# set(CMAKE_INSTALL_RPATH "${MBEDTLS_LIB_DIR}")
+# set(CMAKE_BUILD_RPATH "${MBEDTLS_LIB_DIR}")
 
 # Test executable
 add_executable(test_ml_dsa
@@ -89,3 +88,4 @@ target_link_libraries(test_ml_dsa ml-dsa-65 mldsa-native-65)
 # Debug test
 add_executable(debug_test debug_test.c)
 target_link_libraries(debug_test ml-dsa-65)
+
