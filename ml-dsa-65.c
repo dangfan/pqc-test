@@ -784,6 +784,20 @@ static void __attribute__((noinline)) w1_encode_update(SHA3_CTX_T *ctx,
   }
 }
 
+/* Pack a w1 polynomial (already computed, 4-bit coefficients) and feed
+ * directly into a SHAKE context.  Same streaming approach as
+ * w1_encode_update but skips the HighBits step. */
+static void __attribute__((noinline)) w1_pack_update(SHA3_CTX_T *ctx,
+                                                     const int32_t w1[N]) {
+  uint8_t chunk[16];
+  for (int i = 0; i < N; i += 32) {
+    for (int j = 0; j < 16; j++)
+      chunk[j] = (uint8_t)((uint32_t)w1[i + 2*j]
+                          | ((uint32_t)w1[i + 2*j + 1] << 4));
+    shake_update(ctx, chunk, 16);
+  }
+}
+
 static int make_hint(int32_t z, int32_t r) {
   return (high_bits(r) != high_bits(freeze(r + z)));
 }
@@ -1197,7 +1211,6 @@ int ml_dsa_65_verify(const uint8_t *msg, size_t msg_len,
   SHA3_CTX_T shake_ctx;
   uint8_t mu[64], tr[MLDSA_TRBYTES];
   uint8_t c_tilde_check[MLDSA_C_TILDE_BYTES];
-  uint8_t w1_packed[MLDSA_POLYW1_PACKEDBYTES];
 
   if (sig_len != MLDSA_SIG_BYTES) return -1;
   if (ctx_len > 255) return -1;
@@ -1273,16 +1286,17 @@ int ml_dsa_65_verify(const uint8_t *msg, size_t msg_len,
     poly_caddq(poly2);
     /* poly2 = A[i]*z in normal domain */
 
-    /* Compute c * (t1[i] << D) via Kronecker (normal domain) */
+    /* Compute c * (t1[i] << D) via Kronecker (c is in PKE_SLOT0) */
     unpack_t1(poly0, pk + 32 + i * MLDSA_POLYT1_PACKEDBYTES);
     for (int n = 0; n < N; n++)
       poly0[n] <<= D_BITS;
     poly_reduce(poly0);
-    pke_load_poly(poly1, PKE_SLOT0); /* c (normal domain) */
-    poly_mul(poly0, poly1, poly0);
+    poly_caddq(poly0);  /* ensure [0, Q) for Kronecker packing */
+    poly_mul_challenge(poly1, poly0);
+    /* poly1 = c * (t1[i] << D) */
 
     /* w'_approx = Az - c*(t1<<D) */
-    poly_sub(poly2, poly2, poly0);
+    poly_sub(poly2, poly2, poly1);
     poly_reduce(poly2);
     poly_caddq(poly2);
 
@@ -1296,8 +1310,7 @@ int ml_dsa_65_verify(const uint8_t *msg, size_t msg_len,
       for (int n = 0; n < N; n++)
         poly1[n] = use_hint(poly0[n], poly2[n]);
     }
-    pack_w1(w1_packed, poly1);
-    shake_update(&shake_ctx, w1_packed, MLDSA_POLYW1_PACKEDBYTES);
+    w1_pack_update(&shake_ctx, poly1);
   }
 
   shake_finalize(&shake_ctx);
