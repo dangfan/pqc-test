@@ -1077,7 +1077,253 @@ int ml_dsa_65_sign(uint8_t *sig, size_t *sig_len,
 }
 
 /* ------------------------------------------------------------------ */
-/*  ML-DSA-65 Key Generation (FIPS 204, Algorithm 6)                   */
+/*  ML-DSA-65 Signing from seed (no sk buffer)                         */
+/*                                                                      */
+/*  Same three-pass approach as ml_dsa_65_sign, but regenerates s1,     */
+/*  s2, t0 from seed on the fly.  ~2-3x slower due to recomputation.   */
+/* ------------------------------------------------------------------ */
+
+/* Helper: regenerate t0[i] from keygen secrets.
+ * Computes row i of t = A*s1 + s2, then Power2Round to extract t0.
+ * WARNING: clobbers all PKE registers.
+ * Result in out[N], coefficients in [0, Q).
+ * scratch[N] is used as temporary space. */
+static void regen_t0(int32_t out[N], const uint8_t rho[32],
+                     const uint8_t rho_prime[64], int i,
+                     int32_t scratch[N]) {
+  /* Accumulate A_hat[i][j] * s1_hat[j] in PKE_SLOT1 */
+  pke_mmm_setup();
+  memset(out, 0, N * sizeof(int32_t));
+  pke_store_poly(PKE_SLOT1, out);
+  for (int j = 0; j < L; j++) {
+    poly_rej_bounded(scratch, rho_prime, (uint16_t)j);
+    ntt(scratch);
+    pke_store_poly(PKE_SLOT0, scratch);
+    poly_rej_ntt(scratch, rho, (uint8_t)i, (uint8_t)j);
+    pointwise_acc_pke(scratch, scratch);
+  }
+  pke_load_poly(out, PKE_SLOT1);
+  invntt(out);
+
+  /* Add s2[i] */
+  poly_rej_bounded(scratch, rho_prime, (uint16_t)(L + i));
+  poly_add(out, out, scratch);
+  poly_caddq(out);
+
+  /* Power2Round: extract t0 */
+  for (int n = 0; n < N; n++) {
+    int32_t t0_coeff;
+    (void)power2round(&t0_coeff, out[n]);
+    out[n] = t0_coeff;
+  }
+  poly_caddq(out);
+}
+
+/* Helper: restore challenge c from c_tilde into PKE_SLOT0.
+ * Uses scratch[N] as temporary. */
+static void restore_challenge(const uint8_t c_tilde[MLDSA_C_TILDE_BYTES],
+                              int32_t scratch[N]) {
+  poly_challenge(scratch, c_tilde);
+  poly_caddq(scratch);
+  pke_store_poly(PKE_SLOT0, scratch);
+}
+
+int ml_dsa_65_sign_seed(uint8_t *sig, size_t *sig_len,
+                        const uint8_t *msg, size_t msg_len,
+                        const uint8_t *ctx, size_t ctx_len,
+                        const uint8_t *seed, const uint8_t *tr) {
+  poly poly0, poly1;
+  SHA3_CTX_T shake_ctx;
+  uint8_t mu[64];
+  uint8_t rho[32], rho_prime_sign[64], K_seed[32];
+  uint8_t rho_prime_keygen[64];
+  uint8_t c_tilde[MLDSA_C_TILDE_BYTES];
+  uint16_t kappa;
+  int reject;
+
+  if (ctx_len > 255) return -1;
+
+  /* ---- Derive keygen secrets from seed ---- */
+  shake256_init(&shake_ctx);
+  shake_update(&shake_ctx, seed, 32);
+  {
+    uint8_t dom[2] = { (uint8_t)K, (uint8_t)L };
+    shake_update(&shake_ctx, dom, 2);
+  }
+  shake_finalize(&shake_ctx);
+  shake_squeeze(&shake_ctx, rho, 32);
+  shake_squeeze(&shake_ctx, rho_prime_keygen, 64);
+  shake_squeeze(&shake_ctx, K_seed, 32);
+
+  /* ---- Compute mu = H(tr || 0x00 || ctx_len || ctx || msg) ---- */
+  {
+    uint8_t hdr[2];
+    shake256_init(&shake_ctx);
+    shake_update(&shake_ctx, tr, MLDSA_TRBYTES);
+    hdr[0] = 0x00;
+    hdr[1] = (uint8_t)ctx_len;
+    shake_update(&shake_ctx, hdr, 2);
+    if (ctx_len > 0)
+      shake_update(&shake_ctx, ctx, ctx_len);
+    shake_update(&shake_ctx, msg, msg_len);
+    shake_finalize(&shake_ctx);
+    shake_squeeze(&shake_ctx, mu, 64);
+  }
+
+  /* ---- Compute rho' for signing = H(K || rnd || mu) ---- */
+  {
+    uint8_t rnd[32];
+    memset(rnd, 0, 32);
+    shake256_init(&shake_ctx);
+    shake_update(&shake_ctx, K_seed, 32);
+    shake_update(&shake_ctx, rnd, 32);
+    shake_update(&shake_ctx, mu, 64);
+    shake_finalize(&shake_ctx);
+    shake_squeeze(&shake_ctx, rho_prime_sign, 64);
+  }
+
+  /* ---- Signing loop ---- */
+  kappa = 0;
+  for (;;) {
+    reject = 0;
+
+    /* ==== Pass 1: c_tilde = H(mu || w1Encode(w)) ==== */
+    shake256_init(&shake_ctx);
+    shake_update(&shake_ctx, mu, 64);
+    for (int i = 0; i < K; i++) {
+      compute_w_hat_row(rho, rho_prime_sign, kappa, i, poly0, poly1);
+      pke_load_poly(poly0, PKE_SLOT1);
+      invntt(poly0);
+      poly_caddq(poly0);
+      w1_encode_update(&shake_ctx, poly0);
+    }
+    shake_finalize(&shake_ctx);
+    shake_squeeze(&shake_ctx, c_tilde, MLDSA_C_TILDE_BYTES);
+
+    /* ==== Challenge c ==== */
+    restore_challenge(c_tilde, poly0);
+
+    /* ==== Pass 2: z = y + c*s1, check bounds ==== */
+    for (int j = 0; j < L; j++) {
+      poly_expand_mask(poly0, rho_prime_sign, kappa + (uint16_t)j);
+      pke_store_poly(PKE_SLOT1, poly0);
+      poly_rej_bounded(poly0, rho_prime_keygen, (uint16_t)j);
+      poly_caddq(poly0);
+      poly_mul_challenge(poly1, poly0);
+      pke_load_poly(poly0, PKE_SLOT1);
+      poly_add(poly0, poly0, poly1);
+      poly_reduce(poly0);
+      for (int n = 0; n < N; n++) {
+        if (poly0[n] > Q / 2) poly0[n] -= Q;
+        if (poly0[n] >= GAMMA1 - BETA_B || poly0[n] <= -(GAMMA1 - BETA_B)) {
+          reject = 1;
+          break;
+        }
+      }
+      if (reject) break;
+      pack_z(sig + MLDSA_C_TILDE_BYTES + j * MLDSA_POLYZ_PACKEDBYTES,
+             poly0);
+    }
+    if (reject) { kappa += L; continue; }
+
+    /* ==== Pass 3: check r0, ct0, make hint ==== */
+    /* For each row i we need both c*t0[i] and r = w[i] - c*s2[i]
+     * simultaneously for the hint.  regen_t0 and compute_w_hat_row
+     * both clobber PKE, so the order is:
+     *
+     *   1. regen_t0 → poly0 = t0[i]        (clobbers PKE)
+     *   2. restore c, compute c*t0 → poly1  (needs PKE_SLOT0)
+     *   3. check ||c*t0||∞ < gamma2
+     *   4. recompute w[i]                   (clobbers PKE)
+     *   5. restore c, compute c*s2 → poly0
+     *   6. r = w - cs2, check LowBits(r)
+     *   7. make hint(-ct0, r + ct0)
+     *
+     * c*t0 (poly1) survives steps 4-6 because it stays on the stack.
+     * We regenerate t0 once and recompute w once per row. */
+    {
+      uint8_t *hint_buf = sig + MLDSA_C_TILDE_BYTES
+                        + L * MLDSA_POLYZ_PACKEDBYTES;
+      int hint_count = 0;
+      memset(hint_buf, 0, OMEGA + K);
+
+      for (int i = 0; i < K; i++) {
+        /* Step 1: regen t0[i] */
+        regen_t0(poly0, rho, rho_prime_keygen, i, poly1);
+
+        /* Step 2: c*t0[i] → poly1 (persists through steps 4-7) */
+        restore_challenge(c_tilde, poly1);
+        poly_mul_challenge(poly1, poly0);
+
+        /* Step 3: check ||c*t0||∞ < gamma2 */
+        for (int n = 0; n < N; n++) {
+          int32_t v = poly1[n];
+          if (v > Q / 2) v -= Q;
+          if (v >= (int32_t)GAMMA2 || v <= -(int32_t)GAMMA2) {
+            reject = 1;
+            break;
+          }
+        }
+        if (reject) break;
+
+        /* Step 4: recompute w[i] (clobbers PKE, but poly1 = ct0 is safe) */
+        compute_w_hat_row(rho, rho_prime_sign, kappa, i, poly0, poly0);
+        pke_load_poly(poly0, PKE_SLOT1);
+        invntt(poly0);
+        poly_caddq(poly0);
+        /* poly0 = w[i] */
+
+        /* Step 5: restore c, save w to PKE_SLOT1, compute c*s2 */
+        pke_store_poly(PKE_SLOT1, poly0);
+        restore_challenge(c_tilde, poly0);
+        poly_rej_bounded(poly0, rho_prime_keygen, (uint16_t)(L + i));
+        poly_caddq(poly0);
+        poly_mul_challenge(poly0, poly0);
+        /* poly0 = c*s2[i] */
+
+        /* Step 6: r = w[i] - c*s2[i] */
+        {
+          int32_t tmp[N];
+          pke_load_poly(tmp, PKE_SLOT1);  /* w[i] */
+          poly_sub(poly0, tmp, poly0);
+        }
+        poly_reduce(poly0);
+        /* poly0 = r = w - cs2 */
+
+        /* Check ||LowBits(r)||∞ >= gamma2 - beta */
+        for (int n = 0; n < N; n++) {
+          int32_t r0 = low_bits(poly0[n]);
+          if (r0 >= (int32_t)(GAMMA2 - BETA_B) ||
+              r0 <= -(int32_t)(GAMMA2 - BETA_B)) {
+            reject = 1;
+            break;
+          }
+        }
+        if (reject) break;
+
+        /* Step 7: make hint(-ct0, r + ct0) */
+        /* poly0 = r, poly1 = ct0 */
+        for (int n = 0; n < N; n++) {
+          int32_t neg_ct0 = freeze(-poly1[n]);
+          int32_t w_cs2_ct0 = freeze(poly0[n] + poly1[n]);
+          if (make_hint(neg_ct0, w_cs2_ct0)) {
+            if (hint_count >= OMEGA) { reject = 1; break; }
+            hint_buf[hint_count++] = (uint8_t)n;
+          }
+        }
+        if (reject) break;
+        hint_buf[OMEGA + i] = (uint8_t)hint_count;
+      }
+    }
+    if (reject) { kappa += L; continue; }
+
+    /* ==== Encode signature ==== */
+    memcpy(sig, c_tilde, MLDSA_C_TILDE_BYTES);
+    *sig_len = MLDSA_SIG_BYTES;
+    return 0;
+  }
+}
+
 /*                                                                      */
 /*  pk = (rho || t1_packed)                                             */
 /*  sk = (rho || K || tr || s1_packed || s2_packed || t0_packed)        */
