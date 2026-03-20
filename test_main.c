@@ -485,6 +485,132 @@ static int test_random_interop(void) {
   return 0;
 }
 
+/* ---- Test 6: keygen NULL combinations ---- */
+
+static int test_keygen_null(void) {
+  uint8_t seed[32];
+  static uint8_t pk[MLDSA_PK_BYTES];
+  static uint8_t sk[MLDSA_SK_BYTES];
+  static uint8_t pk_ref[MLDSA_PK_BYTES];
+  static uint8_t sk_ref[MLDSA_SK_BYTES];
+  uint8_t tr1[MLDSA_TRBYTES], tr2[MLDSA_TRBYTES], tr_ref[MLDSA_TRBYTES];
+
+  printf("\n=== Test 6: keygen NULL parameter combinations ===\n");
+
+  hex2bin(seed, ACVP_TC26_SEED_HEX, 32);
+
+  /* Reference: full keygen */
+  if (ml_dsa_65_keygen(pk_ref, sk_ref, tr_ref, seed) != 0) return 1;
+
+  /* tr from sk should match */
+  if (memcmp(tr_ref, sk_ref + 64, MLDSA_TRBYTES) != 0) {
+    printf("FAIL: tr_out != sk.tr\n");
+    return 1;
+  }
+
+  /* NULL sk: only pk + tr */
+  if (ml_dsa_65_keygen(pk, NULL, tr1, seed) != 0) return 1;
+  if (memcmp(pk, pk_ref, MLDSA_PK_BYTES) != 0) {
+    printf("FAIL: pk mismatch with NULL sk\n");
+    return 1;
+  }
+  if (memcmp(tr1, tr_ref, MLDSA_TRBYTES) != 0) {
+    printf("FAIL: tr mismatch with NULL sk\n");
+    return 1;
+  }
+
+  /* NULL pk: only sk + tr */
+  if (ml_dsa_65_keygen(NULL, sk, tr2, seed) != 0) return 1;
+  if (memcmp(sk, sk_ref, MLDSA_SK_BYTES) != 0) {
+    printf("FAIL: sk mismatch with NULL pk\n");
+    return 1;
+  }
+  if (memcmp(tr2, tr_ref, MLDSA_TRBYTES) != 0) {
+    printf("FAIL: tr mismatch with NULL pk\n");
+    return 1;
+  }
+
+  /* NULL pk and sk: only tr */
+  if (ml_dsa_65_keygen(NULL, NULL, tr1, seed) != 0) return 1;
+  if (memcmp(tr1, tr_ref, MLDSA_TRBYTES) != 0) {
+    printf("FAIL: tr mismatch with NULL pk+sk\n");
+    return 1;
+  }
+
+  printf("  keygen NULL combinations: PASS\n");
+  return 0;
+}
+
+/* ---- Test 7: sign_seed matches sign, plus verify ---- */
+
+static int test_sign_seed(void) {
+  static uint8_t pk[MLDSA_PK_BYTES];
+  static uint8_t sk[MLDSA_SK_BYTES];
+  static uint8_t sig_sk[MLDSA_SIG_BYTES];
+  static uint8_t sig_seed[MLDSA_SIG_BYTES];
+  uint8_t seed[32], tr[MLDSA_TRBYTES];
+  size_t sig_len_sk, sig_len_seed;
+  int nrounds = 16;
+
+  printf("\n=== Test 7: sign_seed vs sign (%d rounds) ===\n", nrounds);
+
+  SHA3_CTX_T prng;
+  uint8_t prng_seed[32] = "pqc-test-sign-seed-interop!!!!!";
+  shake256_init(&prng);
+  shake_update(&prng, prng_seed, 32);
+  shake_finalize(&prng);
+
+  for (int round = 0; round < nrounds; round++) {
+    uint8_t msg[128], ctx[16];
+    uint8_t lens[2];
+    shake_squeeze(&prng, seed, 32);
+    shake_squeeze(&prng, lens, 2);
+    size_t msg_len = 1 + (lens[0] % sizeof(msg));
+    size_t ctx_len = lens[1] % (sizeof(ctx) + 1);
+    shake_squeeze(&prng, msg, msg_len);
+    if (ctx_len > 0)
+      shake_squeeze(&prng, ctx, ctx_len);
+
+    /* Keygen */
+    if (ml_dsa_65_keygen(pk, sk, tr, seed) != 0) {
+      printf("FAIL round %d: keygen\n", round);
+      return 1;
+    }
+
+    /* Sign with sk */
+    if (ml_dsa_65_sign(sig_sk, &sig_len_sk, msg, msg_len,
+                       ctx_len > 0 ? ctx : NULL, ctx_len, sk) != 0) {
+      printf("FAIL round %d: sign with sk\n", round);
+      return 1;
+    }
+
+    /* Sign with seed */
+    if (ml_dsa_65_sign_seed(sig_seed, &sig_len_seed, msg, msg_len,
+                            ctx_len > 0 ? ctx : NULL, ctx_len,
+                            seed, tr) != 0) {
+      printf("FAIL round %d: sign_seed\n", round);
+      return 1;
+    }
+
+    /* Signatures must be identical (deterministic) */
+    if (sig_len_sk != sig_len_seed ||
+        memcmp(sig_sk, sig_seed, sig_len_sk) != 0) {
+      printf("FAIL round %d: signature mismatch\n", round);
+      return 1;
+    }
+
+    /* Verify seed-produced signature */
+    if (ml_dsa_65_verify(msg, msg_len, sig_seed, sig_len_seed,
+                         ctx_len > 0 ? ctx : NULL, ctx_len, pk) != 0) {
+      printf("FAIL round %d: verify seed sig\n", round);
+      return 1;
+    }
+  }
+
+  printf("  sign_seed vs sign (%d rounds): PASS\n", nrounds);
+  return 0;
+}
+
 /* ---- Main ---- */
 
 int main(void) {
@@ -497,6 +623,8 @@ int main(void) {
   failures += test_reference_sign_interop();
   failures += test_context_string();
   failures += test_random_interop();
+  failures += test_keygen_null();
+  failures += test_sign_seed();
 
   printf("\n=== Summary: %s (%d failure%s) ===\n",
          failures == 0 ? "ALL PASSED" : "SOME FAILED",

@@ -520,9 +520,59 @@ static void poly_mul_challenge(int32_t result[N], const int32_t b[N]) {
   }
 }
 
-/* ------------------------------------------------------------------ */
-/*  Basic polynomial operations                                        */
-/* ------------------------------------------------------------------ */
+/* Like poly_mul_challenge, but reads b from pke_slot (16 regs of 16 coeffs).
+ * Allows result to safely alias the original b buffer on the stack. */
+static void poly_mul_challenge_pke(int32_t result[N], int pke_slot) {
+  int32_t a_chunk[KRON_G];
+  int32_t b_chunk[KRON_G];
+  uint32_t a_packed[KRON_PACK_WORDS];
+  uint32_t b_packed[KRON_PACK_WORDS];
+  uint32_t tmp[KRON_PKE_LEN];
+
+  memset(result, 0, N * sizeof(int32_t));
+  kron_mmm_setup();
+
+  for (int gi = 0; gi < KRON_T; gi++) {
+    eccPKEReadBuf((uint32_t *)a_chunk, PKE_SLOT0 + gi, KRON_G);
+    kron_pack(a_packed, a_chunk, KRON_G);
+
+    memset(tmp, 0, KRON_PKE_LEN * 4);
+    memcpy(tmp, a_packed, KRON_PACK_WORDS * 4);
+    host_to_pke(tmp, KRON_PKE_LEN);
+    eccPKEWriteBuf(KRON_REG_A, tmp, KRON_PKE_LEN);
+
+    for (int gj = 0; gj < KRON_T; gj++) {
+      eccPKEReadBuf((uint32_t *)b_chunk, pke_slot + gj, KRON_G);
+      kron_pack(b_packed, b_chunk, KRON_G);
+
+      memset(tmp, 0, KRON_PKE_LEN * 4);
+      memcpy(tmp, b_packed, KRON_PACK_WORDS * 4);
+      host_to_pke(tmp, KRON_PKE_LEN);
+      eccPKEWriteBuf(KRON_REG_B, tmp, KRON_PKE_LEN);
+
+      sm2MonMul(KRON_REG_R, KRON_REG_A, KRON_REG_B);
+
+      eccPKEReadBuf(tmp, KRON_REG_R, KRON_PKE_LEN);
+      pke_to_host(tmp, KRON_PKE_LEN);
+
+      int base = (gi + gj) * KRON_G;
+      for (int k = 0; k < 2 * KRON_G - 1; k++) {
+        int64_t coeff = kron_unpack_one(k, tmp);
+        int idx = base + k;
+        int64_t v;
+        if (idx < N) {
+          v = (int64_t)result[idx] + coeff;
+        } else {
+          idx -= N;
+          v = (int64_t)result[idx] - coeff;
+        }
+        v %= Q;
+        if (v < 0) v += Q;
+        result[idx] = (int32_t)v;
+      }
+    }
+  }
+}
 
 static void poly_add(int32_t c[N], const int32_t a[N], const int32_t b[N]) {
   for (int i = 0; i < N; i++) c[i] = a[i] + b[i];
@@ -853,6 +903,22 @@ static void pointwise_acc_pke(const int32_t a[N], const int32_t b[N]) {
   }
 }
 
+/* Like pointwise_acc_pke, but reads b from PKE_SLOT0 instead of stack.
+ * SLOT1 += a[k] * SLOT0[k].  Only needs one stack poly for a. */
+static void pointwise_acc_pke_slot0(const int32_t a[N]) {
+  pke_mmm_setup();
+  int32_t w_chunk[PKE_COEFFS_PER_REG];
+  int32_t b_chunk[PKE_COEFFS_PER_REG];
+  for (int r = 0; r < N / PKE_COEFFS_PER_REG; r++) {
+    eccPKEReadBuf((uint32_t *)w_chunk, PKE_SLOT1 + r, PKE_COEFFS_PER_REG);
+    eccPKEReadBuf((uint32_t *)b_chunk, PKE_SLOT0 + r, PKE_COEFFS_PER_REG);
+    for (int k = 0; k < PKE_COEFFS_PER_REG; k++)
+      w_chunk[k] += hw_mon_mul(a[r * PKE_COEFFS_PER_REG + k], b_chunk[k]);
+    eccPKEWriteBuf(PKE_SLOT1 + r, (const uint32_t *)w_chunk,
+                   PKE_COEFFS_PER_REG);
+  }
+}
+
 static void compute_w_hat_row(const uint8_t *rho,
                               const uint8_t *rho_prime,
                               uint16_t kappa, int row,
@@ -1089,25 +1155,37 @@ int ml_dsa_65_sign(uint8_t *sig, size_t *sig_len,
  * Result in out[N], coefficients in [0, Q).
  * scratch[N] is used as temporary space. */
 static void regen_t0(int32_t out[N], const uint8_t rho[32],
-                     const uint8_t rho_prime[64], int i,
-                     int32_t scratch[N]) {
-  /* Accumulate A_hat[i][j] * s1_hat[j] in PKE_SLOT1 */
-  pke_mmm_setup();
-  memset(out, 0, N * sizeof(int32_t));
-  pke_store_poly(PKE_SLOT1, out);
+                     const uint8_t rho_prime[64], int i) {
+  /* Accumulate A_hat[i][j] * s1_hat[j] in PKE_SLOT1.
+   * Uses only out[N] as scratch — s1_hat stored in PKE_SLOT0,
+   * read by pointwise_acc_pke_slot0. */
+  {
+    uint32_t zeros[PKE_COEFFS_PER_REG];
+    memset(zeros, 0, sizeof(zeros));
+    for (int r = 0; r < N / PKE_COEFFS_PER_REG; r++)
+      eccPKEWriteBuf(PKE_SLOT1 + r, zeros, PKE_COEFFS_PER_REG);
+  }
   for (int j = 0; j < L; j++) {
-    poly_rej_bounded(scratch, rho_prime, (uint16_t)j);
-    ntt(scratch);
-    pke_store_poly(PKE_SLOT0, scratch);
-    poly_rej_ntt(scratch, rho, (uint8_t)i, (uint8_t)j);
-    pointwise_acc_pke(scratch, scratch);
+    poly_rej_bounded(out, rho_prime, (uint16_t)j);
+    ntt(out);
+    pke_store_poly(PKE_SLOT0, out);            /* s1_hat → SLOT0 */
+    poly_rej_ntt(out, rho, (uint8_t)i, (uint8_t)j);  /* A_hat → out */
+    pointwise_acc_pke_slot0(out);              /* SLOT1 += A_hat * SLOT0 */
   }
   pke_load_poly(out, PKE_SLOT1);
   invntt(out);
 
-  /* Add s2[i] */
-  poly_rej_bounded(scratch, rho_prime, (uint16_t)(L + i));
-  poly_add(out, out, scratch);
+  /* Add s2[i]: save t to SLOT1, gen s2 into out, add from SLOT1 */
+  pke_store_poly(PKE_SLOT1, out);
+  poly_rej_bounded(out, rho_prime, (uint16_t)(L + i));
+  {
+    int32_t t_chunk[PKE_COEFFS_PER_REG];
+    for (int r = 0; r < N / PKE_COEFFS_PER_REG; r++) {
+      eccPKEReadBuf((uint32_t *)t_chunk, PKE_SLOT1 + r, PKE_COEFFS_PER_REG);
+      for (int k = 0; k < PKE_COEFFS_PER_REG; k++)
+        out[r * PKE_COEFFS_PER_REG + k] += t_chunk[k];
+    }
+  }
   poly_caddq(out);
 
   /* Power2Round: extract t0 */
@@ -1227,20 +1305,12 @@ int ml_dsa_65_sign_seed(uint8_t *sig, size_t *sig_len,
     if (reject) { kappa += L; continue; }
 
     /* ==== Pass 3: check r0, ct0, make hint ==== */
-    /* For each row i we need both c*t0[i] and r = w[i] - c*s2[i]
-     * simultaneously for the hint.  regen_t0 and compute_w_hat_row
-     * both clobber PKE, so the order is:
-     *
-     *   1. regen_t0 → poly0 = t0[i]        (clobbers PKE)
-     *   2. restore c, compute c*t0 → poly1  (needs PKE_SLOT0)
-     *   3. check ||c*t0||∞ < gamma2
-     *   4. recompute w[i]                   (clobbers PKE)
-     *   5. restore c, compute c*s2 → poly0
-     *   6. r = w - cs2, check LowBits(r)
-     *   7. make hint(-ct0, r + ct0)
-     *
-     * c*t0 (poly1) survives steps 4-6 because it stays on the stack.
-     * We regenerate t0 once and recompute w once per row. */
+    /* Per row:
+     *   Phase A: compute r = w-cs2, check LowBits (uses poly0+poly1)
+     *   Phase B: regen t0 (single-scratch), compute ct0 → poly1,
+     *     check ct0 bounds, recompute w using pointwise_acc_pke_slot0
+     *     (preserves poly1=ct0), compute cs2 into stack tmp, get r,
+     *     make hint. */
     {
       uint8_t *hint_buf = sig + MLDSA_C_TILDE_BYTES
                         + L * MLDSA_POLYZ_PACKEDBYTES;
@@ -1248,49 +1318,22 @@ int ml_dsa_65_sign_seed(uint8_t *sig, size_t *sig_len,
       memset(hint_buf, 0, OMEGA + K);
 
       for (int i = 0; i < K; i++) {
-        /* Step 1: regen t0[i] */
-        regen_t0(poly0, rho, rho_prime_keygen, i, poly1);
-
-        /* Step 2: c*t0[i] → poly1 (persists through steps 4-7) */
-        restore_challenge(c_tilde, poly1);
-        poly_mul_challenge(poly1, poly0);
-
-        /* Step 3: check ||c*t0||∞ < gamma2 */
-        for (int n = 0; n < N; n++) {
-          int32_t v = poly1[n];
-          if (v > Q / 2) v -= Q;
-          if (v >= (int32_t)GAMMA2 || v <= -(int32_t)GAMMA2) {
-            reject = 1;
-            break;
-          }
-        }
-        if (reject) break;
-
-        /* Step 4: recompute w[i] (clobbers PKE, but poly1 = ct0 is safe) */
-        compute_w_hat_row(rho, rho_prime_sign, kappa, i, poly0, poly0);
+        /* Phase A: r = w - cs2, LowBits check */
+        compute_w_hat_row(rho, rho_prime_sign, kappa, i, poly0, poly1);
         pke_load_poly(poly0, PKE_SLOT1);
         invntt(poly0);
         poly_caddq(poly0);
-        /* poly0 = w[i] */
+        pke_store_poly(PKE_SLOT1, poly0);  /* save w */
 
-        /* Step 5: restore c, save w to PKE_SLOT1, compute c*s2 */
-        pke_store_poly(PKE_SLOT1, poly0);
         restore_challenge(c_tilde, poly0);
         poly_rej_bounded(poly0, rho_prime_keygen, (uint16_t)(L + i));
         poly_caddq(poly0);
-        poly_mul_challenge(poly0, poly0);
-        /* poly0 = c*s2[i] */
+        poly_mul_challenge(poly1, poly0);  /* cs2 */
 
-        /* Step 6: r = w[i] - c*s2[i] */
-        {
-          int32_t tmp[N];
-          pke_load_poly(tmp, PKE_SLOT1);  /* w[i] */
-          poly_sub(poly0, tmp, poly0);
-        }
+        pke_load_poly(poly0, PKE_SLOT1);   /* w */
+        poly_sub(poly0, poly0, poly1);
         poly_reduce(poly0);
-        /* poly0 = r = w - cs2 */
 
-        /* Check ||LowBits(r)||∞ >= gamma2 - beta */
         for (int n = 0; n < N; n++) {
           int32_t r0 = low_bits(poly0[n]);
           if (r0 >= (int32_t)(GAMMA2 - BETA_B) ||
@@ -1301,8 +1344,55 @@ int ml_dsa_65_sign_seed(uint8_t *sig, size_t *sig_len,
         }
         if (reject) break;
 
-        /* Step 7: make hint(-ct0, r + ct0) */
+        /* Phase B: ct0 + hint */
+        regen_t0(poly0, rho, rho_prime_keygen, i);
+
+        restore_challenge(c_tilde, poly1);
+        poly_mul_challenge(poly1, poly0);  /* ct0 — keep in poly1 */
+
+        for (int n = 0; n < N; n++) {
+          int32_t v = poly1[n];
+          if (v > Q / 2) v -= Q;
+          if (v >= (int32_t)GAMMA2 || v <= -(int32_t)GAMMA2) {
+            reject = 1;
+            break;
+          }
+        }
+        if (reject) break;
+
+        /* Recompute w using pointwise_acc_pke_slot0 (only poly0,
+         * preserves poly1=ct0) */
+        {
+          uint32_t zeros[PKE_COEFFS_PER_REG];
+          memset(zeros, 0, sizeof(zeros));
+          for (int r = 0; r < N / PKE_COEFFS_PER_REG; r++)
+            eccPKEWriteBuf(PKE_SLOT1 + r, zeros, PKE_COEFFS_PER_REG);
+        }
+        for (int j = 0; j < L; j++) {
+          poly_expand_mask(poly0, rho_prime_sign, kappa + (uint16_t)j);
+          ntt(poly0);
+          pke_store_poly(PKE_SLOT0, poly0);
+          poly_rej_ntt(poly0, rho, (uint8_t)i, (uint8_t)j);
+          pointwise_acc_pke_slot0(poly0);
+        }
+        pke_load_poly(poly0, PKE_SLOT1);
+        invntt(poly0);
+        poly_caddq(poly0);
+
+        /* cs2 → stack tmp (avoids aliased poly_mul_challenge) */
+        pke_store_poly(PKE_SLOT1, poly0);  /* save w */
+        restore_challenge(c_tilde, poly0);
+        poly_rej_bounded(poly0, rho_prime_keygen, (uint16_t)(L + i));
+        poly_caddq(poly0);
+        {
+          int32_t cs2[N];
+          poly_mul_challenge(cs2, poly0);
+          pke_load_poly(poly0, PKE_SLOT1);  /* w */
+          poly_sub(poly0, poly0, cs2);
+        }
+        poly_reduce(poly0);
         /* poly0 = r, poly1 = ct0 */
+
         for (int n = 0; n < N; n++) {
           int32_t neg_ct0 = freeze(-poly1[n]);
           int32_t w_cs2_ct0 = freeze(poly0[n] + poly1[n]);
