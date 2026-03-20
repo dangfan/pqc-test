@@ -399,6 +399,92 @@ static int test_context_string(void) {
   return 0;
 }
 
+/* ---- Test 5: Randomized sign/verify interop ---- */
+
+static int test_random_interop(void) {
+  int nrounds = 32;
+  static uint8_t pk[MLDSA_PK_BYTES];
+  static uint8_t sk[MLDSA_SK_BYTES];
+  static uint8_t ref_pk[MLDSA_PK_BYTES];
+  static uint8_t ref_sk[MLDSA_SK_BYTES];
+  static uint8_t sig[MLDSA_SIG_BYTES];
+  static uint8_t ref_sig[MLDSA_SIG_BYTES];
+  uint8_t seed[32];
+  uint8_t msg[128];
+  uint8_t ctx[16];
+
+  printf("\n=== Test 5: Randomized sign/verify interop (%d rounds) ===\n",
+         nrounds);
+
+  /* Use SHAKE256 as a deterministic PRNG seeded from a fixed value,
+   * so the test is reproducible but covers many inputs. */
+  SHA3_CTX_T prng;
+  uint8_t prng_seed[32] = "pqc-test-random-interop-seed!!!!";
+  shake256_init(&prng);
+  shake_update(&prng, prng_seed, 32);
+  shake_finalize(&prng);
+
+  for (int round = 0; round < nrounds; round++) {
+    /* Generate random seed, message, context from PRNG */
+    shake_squeeze(&prng, seed, 32);
+    uint8_t lens[2];
+    shake_squeeze(&prng, lens, 2);
+    size_t msg_len = 1 + (lens[0] % sizeof(msg));  /* 1..128 */
+    size_t ctx_len = lens[1] % (sizeof(ctx) + 1);  /* 0..16 */
+    shake_squeeze(&prng, msg, msg_len);
+    if (ctx_len > 0)
+      shake_squeeze(&prng, ctx, ctx_len);
+
+    /* KeyGen: both implementations */
+    if (ml_dsa_65_keygen(pk, sk, seed) != 0) {
+      printf("FAIL round %d: local keygen\n", round);
+      return 1;
+    }
+    if (ref_keygen(ref_pk, ref_sk, seed) != 0) {
+      printf("FAIL round %d: ref keygen\n", round);
+      return 1;
+    }
+    if (memcmp(pk, ref_pk, MLDSA_PK_BYTES) != 0 ||
+        memcmp(sk, ref_sk, MLDSA_SK_BYTES) != 0) {
+      printf("FAIL round %d: keygen mismatch\n", round);
+      return 1;
+    }
+
+    /* Sign: both implementations, compare signatures */
+    size_t sig_len = 0, ref_sig_len = 0;
+    if (ml_dsa_65_sign(sig, &sig_len, msg, msg_len,
+                       ctx_len > 0 ? ctx : NULL, ctx_len, sk) != 0) {
+      printf("FAIL round %d: local sign\n", round);
+      return 1;
+    }
+    if (ref_sign_deterministic(ref_sig, &ref_sig_len, msg, msg_len,
+                               ctx_len > 0 ? ctx : NULL, ctx_len,
+                               ref_sk) != 0) {
+      printf("FAIL round %d: ref sign\n", round);
+      return 1;
+    }
+    if (sig_len != ref_sig_len || memcmp(sig, ref_sig, sig_len) != 0) {
+      printf("FAIL round %d: signature mismatch\n", round);
+      return 1;
+    }
+
+    /* Cross-verify */
+    if (ml_dsa_65_verify(msg, msg_len, ref_sig, ref_sig_len,
+                         ctx_len > 0 ? ctx : NULL, ctx_len, pk) != 0) {
+      printf("FAIL round %d: local verify ref sig\n", round);
+      return 1;
+    }
+    if (ref_verify_sig(sig, sig_len, msg, msg_len,
+                       ctx_len > 0 ? ctx : NULL, ctx_len, ref_pk) != 0) {
+      printf("FAIL round %d: ref verify local sig\n", round);
+      return 1;
+    }
+  }
+
+  printf("  Randomized interop (%d rounds): PASS\n", nrounds);
+  return 0;
+}
+
 /* ---- Main ---- */
 
 int main(void) {
@@ -410,6 +496,7 @@ int main(void) {
   failures += test_deterministic();
   failures += test_reference_sign_interop();
   failures += test_context_string();
+  failures += test_random_interop();
 
   printf("\n=== Summary: %s (%d failure%s) ===\n",
          failures == 0 ? "ALL PASSED" : "SOME FAILED",
