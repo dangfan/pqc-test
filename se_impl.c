@@ -21,6 +21,7 @@ int rsaPKEWriteMc(const uint32_t *buf) {
   mbedtls_mpi a, n;
   mbedtls_mpi_init(&a);
   mbedtls_mpi_init(&n);
+  mbedtls_mpi_free(&Rinv);  /* free previous value before reinit */
   mbedtls_mpi_init(&Rinv);
 
   mbedtls_mpi_read_binary(&n, reg[0], pkeLen * 4);
