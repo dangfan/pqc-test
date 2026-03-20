@@ -1766,3 +1766,365 @@ int ml_dsa_65_selftest(void) {
 
   return 0;
 }
+
+/* ------------------------------------------------------------------ */
+/*  Streaming sign_seed                                                */
+/* ------------------------------------------------------------------ */
+
+/* Re-derive rho and rho_prime_keygen from seed (cheap, one SHAKE). */
+static void derive_keygen_secrets(const uint8_t seed[32],
+                                  uint8_t rho[32],
+                                  uint8_t rho_prime_keygen[64],
+                                  uint8_t K_seed[32]) {
+  SHA3_CTX_T ctx;
+  uint8_t dom[2] = { (uint8_t)K, (uint8_t)L };
+  shake256_init(&ctx);
+  shake_update(&ctx, seed, 32);
+  shake_update(&ctx, dom, 2);
+  shake_finalize(&ctx);
+  shake_squeeze(&ctx, rho, 32);
+  shake_squeeze(&ctx, rho_prime_keygen, 64);
+  if (K_seed) shake_squeeze(&ctx, K_seed, 32);
+}
+
+/* Recompute z[j] = y[j] + c*s1[j], center and pack into buf.
+ * Needs rho_prime_sign (for y), rho_prime_keygen (for s1),
+ * c_tilde (for challenge c), kappa.
+ * Returns 0 on success.  Cannot fail for a previously-accepted kappa. */
+static void recompute_and_pack_z(
+    uint8_t *buf, int j,
+    const uint8_t rho_prime_sign[64],
+    const uint8_t rho_prime_keygen[64],
+    const uint8_t c_tilde[MLDSA_C_TILDE_BYTES],
+    uint16_t kappa,
+    int32_t poly0[N], int32_t poly1[N]) {
+  /* c → PKE_SLOT0 */
+  restore_challenge(c_tilde, poly0);
+  /* s1[j] → poly0 */
+  poly_rej_bounded(poly0, rho_prime_keygen, (uint16_t)j);
+  poly_caddq(poly0);
+  /* cs1 → poly1 (result != input, no aliasing) */
+  poly_mul_challenge(poly1, poly0);
+  /* y[j] → poly0 */
+  poly_expand_mask(poly0, rho_prime_sign, kappa + (uint16_t)j);
+  /* z[j] = y + cs1 */
+  poly_add(poly0, poly0, poly1);
+  poly_reduce(poly0);
+  /* Center and pack */
+  for (int n = 0; n < N; n++)
+    if (poly0[n] > Q / 2) poly0[n] -= Q;
+  pack_z(buf, poly0);
+}
+
+int ml_dsa_65_sign_seed_streaming(
+    uint8_t *out, size_t out_size,
+    mldsa_sign_state_t *state,
+    const uint8_t *msg, size_t msg_len,
+    const uint8_t *ctx, size_t ctx_len,
+    const uint8_t *tr) {
+
+  if (state->phase == 0) {
+    /* ---- Phase 0: full signing, output first chunk ---- */
+
+    /* Run the existing sign_seed to produce the full signature
+     * into a temporary layout: we need c_tilde, z[0..4], hint.
+     *
+     * But we don't have a 3309B buffer.  Instead, replicate the
+     * pass 1-3 logic (check only), then output c_tilde + z[0..1]. */
+
+    poly poly0, poly1;
+    SHA3_CTX_T shake_ctx;
+    uint8_t mu[64];
+    uint8_t rho[32];
+    uint8_t rho_prime_keygen[64], K_seed[32];
+    uint16_t kappa;
+    int reject;
+
+    if (ctx_len > 255) return -1;
+
+    /* Derive keygen secrets from state->seed */
+    derive_keygen_secrets(state->seed, rho, rho_prime_keygen, K_seed);
+
+    /* Compute mu */
+    {
+      uint8_t hdr[2];
+      shake256_init(&shake_ctx);
+      shake_update(&shake_ctx, tr, MLDSA_TRBYTES);
+      hdr[0] = 0x00;
+      hdr[1] = (uint8_t)ctx_len;
+      shake_update(&shake_ctx, hdr, 2);
+      if (ctx_len > 0)
+        shake_update(&shake_ctx, ctx, ctx_len);
+      shake_update(&shake_ctx, msg, msg_len);
+      shake_finalize(&shake_ctx);
+      shake_squeeze(&shake_ctx, mu, 64);
+    }
+
+    /* Compute rho_prime_sign = H(K || rnd || mu) */
+    {
+      uint8_t rnd[32];
+      memset(rnd, 0, 32);
+      shake256_init(&shake_ctx);
+      shake_update(&shake_ctx, K_seed, 32);
+      shake_update(&shake_ctx, rnd, 32);
+      shake_update(&shake_ctx, mu, 64);
+      shake_finalize(&shake_ctx);
+      shake_squeeze(&shake_ctx, state->rho_prime_sign, 64);
+    }
+
+    /* ---- Signing loop (passes 1-3, same as sign_seed) ---- */
+    kappa = 0;
+    for (;;) {
+      reject = 0;
+
+      /* Pass 1: c_tilde */
+      shake256_init(&shake_ctx);
+      shake_update(&shake_ctx, mu, 64);
+      for (int i = 0; i < K; i++) {
+        compute_w_hat_row(rho, state->rho_prime_sign, kappa, i, poly0, poly1);
+        pke_load_poly(poly0, PKE_SLOT1);
+        invntt(poly0);
+        poly_caddq(poly0);
+        w1_encode_update(&shake_ctx, poly0);
+      }
+      shake_finalize(&shake_ctx);
+      shake_squeeze(&shake_ctx, state->c_tilde, MLDSA_C_TILDE_BYTES);
+
+      /* Challenge c */
+      restore_challenge(state->c_tilde, poly0);
+
+      /* Pass 2: z bounds check (no encoding) */
+      for (int j = 0; j < L; j++) {
+        poly_expand_mask(poly0, state->rho_prime_sign, kappa + (uint16_t)j);
+        pke_store_poly(PKE_SLOT1, poly0);
+        poly_rej_bounded(poly0, rho_prime_keygen, (uint16_t)j);
+        poly_caddq(poly0);
+        poly_mul_challenge(poly1, poly0);
+        pke_load_poly(poly0, PKE_SLOT1);
+        poly_add(poly0, poly0, poly1);
+        poly_reduce(poly0);
+        for (int n = 0; n < N; n++) {
+          if (poly0[n] > Q / 2) poly0[n] -= Q;
+          if (poly0[n] >= GAMMA1 - BETA_B || poly0[n] <= -(GAMMA1 - BETA_B)) {
+            reject = 1; break;
+          }
+        }
+        if (reject) break;
+      }
+      if (reject) { kappa += L; continue; }
+
+      /* Pass 3: same as sign_seed (Phase A + Phase B per row) */
+      {
+        int hint_count = 0;
+        memset(state->hint, 0, OMEGA + K);
+
+        for (int i = 0; i < K; i++) {
+          /* Phase A: r = w - cs2, LowBits check */
+          compute_w_hat_row(rho, state->rho_prime_sign, kappa, i, poly0, poly1);
+          pke_load_poly(poly0, PKE_SLOT1);
+          invntt(poly0);
+          poly_caddq(poly0);
+          pke_store_poly(PKE_SLOT1, poly0);
+
+          restore_challenge(state->c_tilde, poly0);
+          poly_rej_bounded(poly0, rho_prime_keygen, (uint16_t)(L + i));
+          poly_caddq(poly0);
+          poly_mul_challenge(poly1, poly0);
+
+          pke_load_poly(poly0, PKE_SLOT1);
+          poly_sub(poly0, poly0, poly1);
+          poly_reduce(poly0);
+
+          for (int n = 0; n < N; n++) {
+            int32_t r0 = low_bits(poly0[n]);
+            if (r0 >= (int32_t)(GAMMA2 - BETA_B) ||
+                r0 <= -(int32_t)(GAMMA2 - BETA_B)) {
+              reject = 1; break;
+            }
+          }
+          if (reject) break;
+
+          /* Phase B: ct0 + hint */
+          regen_t0(poly0, rho, rho_prime_keygen, i);
+          restore_challenge(state->c_tilde, poly1);
+          poly_mul_challenge(poly1, poly0);
+
+          for (int n = 0; n < N; n++) {
+            int32_t v = poly1[n];
+            if (v > Q / 2) v -= Q;
+            if (v >= (int32_t)GAMMA2 || v <= -(int32_t)GAMMA2) {
+              reject = 1; break;
+            }
+          }
+          if (reject) break;
+
+          /* Recompute w, cs2, r for hint */
+          {
+            uint32_t zeros[PKE_COEFFS_PER_REG];
+            memset(zeros, 0, sizeof(zeros));
+            for (int r = 0; r < N / PKE_COEFFS_PER_REG; r++)
+              eccPKEWriteBuf(PKE_SLOT1 + r, zeros, PKE_COEFFS_PER_REG);
+          }
+          for (int j = 0; j < L; j++) {
+            poly_expand_mask(poly0, state->rho_prime_sign, kappa + (uint16_t)j);
+            ntt(poly0);
+            pke_store_poly(PKE_SLOT0, poly0);
+            poly_rej_ntt(poly0, rho, (uint8_t)i, (uint8_t)j);
+            pointwise_acc_pke_slot0(poly0);
+          }
+          pke_load_poly(poly0, PKE_SLOT1);
+          invntt(poly0);
+          poly_caddq(poly0);
+
+          pke_store_poly(PKE_SLOT1, poly0);
+          restore_challenge(state->c_tilde, poly0);
+          poly_rej_bounded(poly0, rho_prime_keygen, (uint16_t)(L + i));
+          poly_caddq(poly0);
+          {
+            int32_t cs2[N];
+            poly_mul_challenge(cs2, poly0);
+            pke_load_poly(poly0, PKE_SLOT1);
+            poly_sub(poly0, poly0, cs2);
+          }
+          poly_reduce(poly0);
+
+          for (int n = 0; n < N; n++) {
+            int32_t neg_ct0 = freeze(-poly1[n]);
+            int32_t w_cs2_ct0 = freeze(poly0[n] + poly1[n]);
+            if (make_hint(neg_ct0, w_cs2_ct0)) {
+              if (hint_count >= OMEGA) { reject = 1; break; }
+              state->hint[hint_count++] = (uint8_t)n;
+            }
+          }
+          if (reject) break;
+          state->hint[OMEGA + i] = (uint8_t)hint_count;
+        }
+      }
+      if (reject) { kappa += L; continue; }
+
+      /* Signing succeeded! Save state, output first chunk. */
+      state->kappa = kappa;
+      state->phase = 1;
+
+      /* Output: c_tilde(48) + z[0](640) + z[1](640) = 1328 */
+      size_t off = 0;
+      memcpy(out + off, state->c_tilde, MLDSA_C_TILDE_BYTES);
+      off += MLDSA_C_TILDE_BYTES;
+      {
+        int32_t p0[N], p1[N];
+        for (int j = 0; j < 2; j++) {
+          recompute_and_pack_z(out + off, j,
+              state->rho_prime_sign, rho_prime_keygen,
+              state->c_tilde, kappa, p0, p1);
+          off += MLDSA_POLYZ_PACKEDBYTES;
+        }
+      }
+      return (int)off;  /* 1328, more to come */
+    }
+  }
+
+  else if (state->phase == 1) {
+    /* Output z[2](640) + z[3](640) = 1280 */
+    uint8_t rho[32], rho_prime_keygen[64];
+    derive_keygen_secrets(state->seed, rho, rho_prime_keygen, NULL);
+    int32_t p0[N], p1[N];
+    size_t off = 0;
+    for (int j = 2; j < 4; j++) {
+      recompute_and_pack_z(out + off, j,
+          state->rho_prime_sign, rho_prime_keygen,
+          state->c_tilde, state->kappa, p0, p1);
+      off += MLDSA_POLYZ_PACKEDBYTES;
+    }
+    state->phase = 2;
+    return (int)off; /* 1280, more to come */
+  }
+
+  else if (state->phase == 2) {
+    /* Output z[4](640) + hint(61) = 701 */
+    uint8_t rho[32], rho_prime_keygen[64];
+    derive_keygen_secrets(state->seed, rho, rho_prime_keygen, NULL);
+    int32_t p0[N], p1[N];
+    size_t off = 0;
+    recompute_and_pack_z(out + off, 4,
+        state->rho_prime_sign, rho_prime_keygen,
+        state->c_tilde, state->kappa, p0, p1);
+    off += MLDSA_POLYZ_PACKEDBYTES;
+    memcpy(out + off, state->hint, OMEGA + K);
+    off += OMEGA + K;
+    state->phase = 0; /* done */
+    return (int)off; /* final chunk bytes */
+  }
+
+  return -1; /* invalid phase */
+}
+
+/* ------------------------------------------------------------------ */
+/*  Streaming keygen (pk export)                                       */
+/* ------------------------------------------------------------------ */
+
+/* Recompute t1[i] from seed, pack into buf (320 bytes). */
+static void recompute_and_pack_t1(
+    uint8_t *buf, int i,
+    const uint8_t rho[32], const uint8_t rho_prime[64],
+    int32_t poly0[N], int32_t poly1[N]) {
+  /* Accumulate A_hat[i][j] * s1_hat[j] in poly1 */
+  memset(poly1, 0, N * sizeof(int32_t));
+  for (int j = 0; j < L; j++) {
+    poly_rej_bounded(poly0, rho_prime, (uint16_t)j);
+    ntt(poly0);
+    /* save s1_hat temporarily, expand A_hat, accumulate */
+    int32_t tmp[N];
+    memcpy(tmp, poly0, sizeof(tmp));
+    poly_rej_ntt(poly0, rho, (uint8_t)i, (uint8_t)j);
+    poly_pointwise_acc(poly1, poly0, tmp);
+  }
+  invntt(poly1);
+
+  /* Add s2[i] */
+  poly_rej_bounded(poly0, rho_prime, (uint16_t)(L + i));
+  poly_add(poly1, poly1, poly0);
+  poly_caddq(poly1);
+
+  /* Power2Round → t1 (high bits) */
+  for (int n = 0; n < N; n++) {
+    int32_t t0_coeff;
+    poly1[n] = power2round(&t0_coeff, poly1[n]);
+  }
+
+  pack_t1(buf, poly1);
+}
+
+int ml_dsa_65_keygen_streaming(
+    uint8_t *out, size_t out_size,
+    mldsa_keygen_state_t *state) {
+
+  uint8_t rho[32], rho_prime[64];
+  derive_keygen_secrets(state->seed, rho, rho_prime, NULL);
+  int32_t poly0[N], poly1[N];
+
+  if (state->phase == 0) {
+    /* Output: rho(32) + t1[0..3](4*320=1280) = 1312 */
+    size_t off = 0;
+    memcpy(out, rho, 32);
+    off = 32;
+    for (int i = 0; i < 4; i++) {
+      recompute_and_pack_t1(out + off, i, rho, rho_prime, poly0, poly1);
+      off += MLDSA_POLYT1_PACKEDBYTES;
+    }
+    state->phase = 1;
+    return (int)off; /* 1312, more to come */
+  }
+
+  else if (state->phase == 1) {
+    /* Output: t1[4..5](2*320=640) = 640 */
+    size_t off = 0;
+    for (int i = 4; i < K; i++) {
+      recompute_and_pack_t1(out + off, i, rho, rho_prime, poly0, poly1);
+      off += MLDSA_POLYT1_PACKEDBYTES;
+    }
+    state->phase = 0;
+    return (int)off; /* final chunk */
+  }
+
+  return -1;
+}

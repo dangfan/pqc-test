@@ -124,4 +124,59 @@ int ml_dsa_65_sign_seed(uint8_t *sig, size_t *sig_len,
 /* Debug: test NTT/INTT round-trip. Returns 0 on success. */
 int ml_dsa_65_selftest(void);
 
+/* ---- Streaming output variants ---- */
+
+/* State for streaming sign_seed.  Caller allocates (static or stack).
+ * Set phase=0 before first call; subsequent calls use phase>0.
+ * After the final call returns 0, the state may be discarded. */
+typedef struct {
+  uint8_t phase;               /* 0=first call, 1,2=subsequent */
+  uint8_t seed[32];
+  uint8_t rho_prime_sign[64];
+  uint8_t c_tilde[MLDSA_C_TILDE_BYTES]; /* 48 */
+  uint8_t hint[MLDSA_OMEGA + MLDSA_K];  /* 61 */
+  uint16_t kappa;
+} mldsa_sign_state_t;
+
+/* Streaming sign from seed+tr.
+ *
+ * phase 0 (first call):
+ *   Runs the full signing algorithm (passes 1-3).
+ *   Outputs the first chunk (c_tilde + z[0..1]) to out.
+ *   Saves intermediate state for subsequent calls.
+ *   msg, ctx, tr must be valid.
+ *
+ * phase > 0 (subsequent calls):
+ *   Recomputes z[j] from state and outputs the next chunk.
+ *   msg, ctx, tr are ignored (may be NULL).
+ *
+ * Returns:
+ *   >0  bytes written to out; if state->phase > 0, more chunks remain.
+ *       if state->phase == 0 after return, this was the final chunk.
+ *   <0  error
+ */
+int ml_dsa_65_sign_seed_streaming(
+    uint8_t *out, size_t out_size,
+    mldsa_sign_state_t *state,
+    const uint8_t *msg, size_t msg_len,
+    const uint8_t *ctx, size_t ctx_len,
+    const uint8_t *tr);
+
+/* State for streaming keygen (pk export). */
+typedef struct {
+  uint8_t phase;
+  uint8_t seed[32];
+} mldsa_keygen_state_t;
+
+/* Streaming keygen (pk export from seed).
+ *
+ * phase 0: outputs rho(32) + t1[0..3](1280) = 1312 bytes.
+ * phase 1: outputs t1[4..5](640) = 640 bytes, returns 0.
+ *
+ * Returns: >0 bytes written; state->phase==0 means done. <0 error.
+ */
+int ml_dsa_65_keygen_streaming(
+    uint8_t *out, size_t out_size,
+    mldsa_keygen_state_t *state);
+
 #endif /* _ML_DSA_65_H_ */
