@@ -1206,6 +1206,26 @@ static void restore_challenge(const uint8_t c_tilde[MLDSA_C_TILDE_BYTES],
   pke_store_poly(PKE_SLOT0, scratch);
 }
 
+
+/* ------------------------------------------------------------------ */
+
+/* Re-derive rho and rho_prime_keygen from seed (cheap, one SHAKE). */
+static void derive_keygen_secrets(const uint8_t seed[32],
+                                  uint8_t rho[32],
+                                  uint8_t rho_prime_keygen[64],
+                                  uint8_t K_seed[32]) {
+  SHA3_CTX_T ctx;
+  uint8_t dom[2] = { (uint8_t)K, (uint8_t)L };
+  shake256_init(&ctx);
+  shake_update(&ctx, seed, 32);
+  shake_update(&ctx, dom, 2);
+  shake_finalize(&ctx);
+  shake_squeeze(&ctx, rho, 32);
+  shake_squeeze(&ctx, rho_prime_keygen, 64);
+  if (K_seed) shake_squeeze(&ctx, K_seed, 32);
+}
+
+
 int ml_dsa_65_sign_seed(uint8_t *sig, size_t *sig_len,
                         const uint8_t *msg, size_t msg_len,
                         const uint8_t *ctx, size_t ctx_len,
@@ -1222,16 +1242,7 @@ int ml_dsa_65_sign_seed(uint8_t *sig, size_t *sig_len,
   if (ctx_len > 255) return -1;
 
   /* ---- Derive keygen secrets from seed ---- */
-  shake256_init(&shake_ctx);
-  shake_update(&shake_ctx, seed, 32);
-  {
-    uint8_t dom[2] = { (uint8_t)K, (uint8_t)L };
-    shake_update(&shake_ctx, dom, 2);
-  }
-  shake_finalize(&shake_ctx);
-  shake_squeeze(&shake_ctx, rho, 32);
-  shake_squeeze(&shake_ctx, rho_prime_keygen, 64);
-  shake_squeeze(&shake_ctx, K_seed, 32);
+  derive_keygen_secrets(seed, rho, rho_prime_keygen, K_seed);
 
   /* ---- Compute mu = H(tr || 0x00 || ctx_len || ctx || msg) ---- */
   {
@@ -1430,17 +1441,8 @@ int ml_dsa_65_keygen(uint8_t *pk, uint8_t *sk, uint8_t *tr_out,
   uint8_t rho[32], rho_prime[64], K_seed[32];
   int compute_tr = (tr_out != NULL || (sk != NULL));  /* sk needs tr too */
 
-  /* Step 1: (rho, rho', K) = H(seed) — squeeze 32+64+32 = 128 bytes */
-  shake256_init(&shake_ctx);
-  shake_update(&shake_ctx, seed, 32);
-  {
-    uint8_t dom[2] = { (uint8_t)K, (uint8_t)L };
-    shake_update(&shake_ctx, dom, 2);
-  }
-  shake_finalize(&shake_ctx);
-  shake_squeeze(&shake_ctx, rho, 32);
-  shake_squeeze(&shake_ctx, rho_prime, 64);
-  shake_squeeze(&shake_ctx, K_seed, 32);
+  /* Step 1: (rho, rho', K) = H(seed) */
+  derive_keygen_secrets(seed, rho, rho_prime, K_seed);
 
   /* Copy rho and K into sk */
   if (sk) {
@@ -1769,24 +1771,6 @@ int ml_dsa_65_selftest(void) {
 
 /* ------------------------------------------------------------------ */
 /*  Streaming sign_seed                                                */
-/* ------------------------------------------------------------------ */
-
-/* Re-derive rho and rho_prime_keygen from seed (cheap, one SHAKE). */
-static void derive_keygen_secrets(const uint8_t seed[32],
-                                  uint8_t rho[32],
-                                  uint8_t rho_prime_keygen[64],
-                                  uint8_t K_seed[32]) {
-  SHA3_CTX_T ctx;
-  uint8_t dom[2] = { (uint8_t)K, (uint8_t)L };
-  shake256_init(&ctx);
-  shake_update(&ctx, seed, 32);
-  shake_update(&ctx, dom, 2);
-  shake_finalize(&ctx);
-  shake_squeeze(&ctx, rho, 32);
-  shake_squeeze(&ctx, rho_prime_keygen, 64);
-  if (K_seed) shake_squeeze(&ctx, K_seed, 32);
-}
-
 /* Recompute z[j] = y[j] + c*s1[j], center and pack into buf.
  * Needs rho_prime_sign (for y), rho_prime_keygen (for s1),
  * c_tilde (for challenge c), kappa.
@@ -2096,27 +2080,54 @@ static void recompute_and_pack_t1(
 
 int ml_dsa_65_keygen_streaming(
     uint8_t *out, size_t out_size,
-    mldsa_keygen_state_t *state) {
+    mldsa_keygen_state_t *state,
+    uint8_t *tr_out) {
 
   uint8_t rho[32], rho_prime[64];
   derive_keygen_secrets(state->seed, rho, rho_prime, NULL);
   int32_t poly0[N], poly1[N];
 
   if (state->phase == 0) {
-    /* Output: rho(32) + t1[0..3](4*320=1280) = 1312 */
+    /* Output: rho(32) + t1[0..3](4*320=1280) = 1312B.
+     *
+     * If tr_out is requested, we must hash ALL 6 rows of t1 to compute
+     * tr = H(pk) = H(rho || t1[0..5]).  So we compute t1[4..5] here too
+     * (only for hashing, not output — they'll be recomputed in phase 1).
+     * This costs 2 extra row computations but avoids storing SHA3 context
+     * or tr in the state struct. */
     size_t off = 0;
     memcpy(out, rho, 32);
     off = 32;
-    for (int i = 0; i < 4; i++) {
-      recompute_and_pack_t1(out + off, i, rho, rho_prime, poly0, poly1);
-      off += MLDSA_POLYT1_PACKEDBYTES;
+
+    SHA3_CTX_T tr_ctx;
+    if (tr_out) {
+      shake256_init(&tr_ctx);
+      shake_update(&tr_ctx, rho, 32);
     }
+
+    for (int i = 0; i < K; i++) {
+      uint8_t t1_packed[MLDSA_POLYT1_PACKEDBYTES];
+      recompute_and_pack_t1(t1_packed, i, rho, rho_prime, poly0, poly1);
+      if (i < 4) {
+        memcpy(out + off, t1_packed, MLDSA_POLYT1_PACKEDBYTES);
+        off += MLDSA_POLYT1_PACKEDBYTES;
+      }
+      if (tr_out)
+        shake_update(&tr_ctx, t1_packed, MLDSA_POLYT1_PACKEDBYTES);
+    }
+
+    if (tr_out) {
+      shake_finalize(&tr_ctx);
+      shake_squeeze(&tr_ctx, tr_out, MLDSA_TRBYTES);
+    }
+
     state->phase = 1;
     return (int)off; /* 1312, more to come */
   }
 
   else if (state->phase == 1) {
-    /* Output: t1[4..5](2*320=640) = 640 */
+    /* Output: t1[4..5](2*320=640) = 640B.
+     * tr_out is ignored in this phase (only valid in phase 0). */
     size_t off = 0;
     for (int i = 4; i < K; i++) {
       recompute_and_pack_t1(out + off, i, rho, rho_prime, poly0, poly1);

@@ -749,12 +749,14 @@ int test_keygen_streaming(void) {
     uint8_t seed[32];
     shake_squeeze(&prng, seed, 32);
 
-    /* Reference: full keygen */
+    /* Reference: full keygen with tr */
     uint8_t pk_ref[MLDSA_PK_BYTES];
-    ml_dsa_65_keygen(pk_ref, NULL, NULL, seed);
+    uint8_t tr_ref[MLDSA_TRBYTES];
+    ml_dsa_65_keygen(pk_ref, NULL, tr_ref, seed);
 
-    /* Streaming: collect chunks */
+    /* Streaming: collect chunks, also get tr */
     uint8_t pk_stream[MLDSA_PK_BYTES];
+    uint8_t tr_stream[MLDSA_TRBYTES];
     size_t total = 0;
     mldsa_keygen_state_t state;
     memset(&state, 0, sizeof(state));
@@ -762,8 +764,8 @@ int test_keygen_streaming(void) {
 
     uint8_t chunk_buf[1340];
 
-    /* Phase 0 */
-    int n = ml_dsa_65_keygen_streaming(chunk_buf, sizeof(chunk_buf), &state);
+    /* Phase 0: pass tr_stream to get tr */
+    int n = ml_dsa_65_keygen_streaming(chunk_buf, sizeof(chunk_buf), &state, tr_stream);
     if (n < 0) {
       printf("  round %d: keygen streaming phase 0 failed\n", r);
       return 1;
@@ -771,9 +773,9 @@ int test_keygen_streaming(void) {
     memcpy(pk_stream + total, chunk_buf, n);
     total += n;
 
-    /* Subsequent phases */
+    /* Subsequent phases: tr_out = NULL */
     while (state.phase > 0) {
-      n = ml_dsa_65_keygen_streaming(chunk_buf, sizeof(chunk_buf), &state);
+      n = ml_dsa_65_keygen_streaming(chunk_buf, sizeof(chunk_buf), &state, NULL);
       if (n < 0) {
         printf("  round %d: keygen streaming phase %d failed\n", r, state.phase);
         return 1;
@@ -791,11 +793,16 @@ int test_keygen_streaming(void) {
     if (memcmp(pk_ref, pk_stream, MLDSA_PK_BYTES) != 0) {
       for (size_t i = 0; i < MLDSA_PK_BYTES; i++) {
         if (pk_ref[i] != pk_stream[i]) {
-          printf("  round %d: MISMATCH at byte %zu (ref=%02x stream=%02x)\n",
+          printf("  round %d: pk MISMATCH at byte %zu (ref=%02x stream=%02x)\n",
                  r, i, pk_ref[i], pk_stream[i]);
           break;
         }
       }
+      return 1;
+    }
+
+    if (memcmp(tr_ref, tr_stream, MLDSA_TRBYTES) != 0) {
+      printf("  round %d: tr MISMATCH\n", r);
       return 1;
     }
   }

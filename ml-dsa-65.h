@@ -171,12 +171,16 @@ typedef struct {
 /* Streaming keygen (pk export from seed).
  *
  * phase 0: outputs rho(32) + t1[0..3](1280) = 1312 bytes.
- * phase 1: outputs t1[4..5](640) = 640 bytes, returns 0.
+ *          If tr_out != NULL, computes tr = H(pk) by hashing all 6 rows
+ *          (t1[4..5] computed for hashing only, recomputed in phase 1).
+ *          tr_out is only written in phase 0.
+ * phase 1: outputs t1[4..5](640) = 640 bytes.
  *
  * Returns: >0 bytes written; state->phase==0 means done. <0 error.
  */
 int ml_dsa_65_keygen_streaming(
     uint8_t *out, size_t out_size,
-    mldsa_keygen_state_t *state);
+    mldsa_keygen_state_t *state,
+    uint8_t *tr_out);
 
 #endif /* _ML_DSA_65_H_ */
