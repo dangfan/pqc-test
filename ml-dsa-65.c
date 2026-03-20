@@ -1086,10 +1086,13 @@ int ml_dsa_65_sign(uint8_t *sig, size_t *sig_len,
 /*  t = NTT^{-1}(A_hat * NTT(s1)) + s2, then Power2Round.             */
 /* ------------------------------------------------------------------ */
 
-int ml_dsa_65_keygen(uint8_t *pk, uint8_t *sk, const uint8_t *seed) {
+int ml_dsa_65_keygen(uint8_t *pk, uint8_t *sk, uint8_t *tr_out,
+                     const uint8_t *seed) {
   poly poly0, poly1, poly2;
   SHA3_CTX_T shake_ctx;
+  SHA3_CTX_T tr_ctx;       /* streaming H(pk) for tr */
   uint8_t rho[32], rho_prime[64], K_seed[32];
+  int compute_tr = (tr_out != NULL || (sk != NULL));  /* sk needs tr too */
 
   /* Step 1: (rho, rho', K) = H(seed) — squeeze 32+64+32 = 128 bytes */
   shake256_init(&shake_ctx);
@@ -1104,31 +1107,41 @@ int ml_dsa_65_keygen(uint8_t *pk, uint8_t *sk, const uint8_t *seed) {
   shake_squeeze(&shake_ctx, K_seed, 32);
 
   /* Copy rho and K into sk */
-  memcpy(sk, rho, 32);           /* sk[0..31]  = rho */
-  memcpy(sk + 32, K_seed, 32);   /* sk[32..63] = K   */
+  if (sk) {
+    memcpy(sk, rho, 32);           /* sk[0..31]  = rho */
+    memcpy(sk + 32, K_seed, 32);   /* sk[32..63] = K   */
+  }
 
   /* Step 2: Generate s1, s2 using rho' and pack into sk */
   for (int j = 0; j < L; j++) {
     poly_rej_bounded(poly0, rho_prime, (uint16_t)j);
-    pack_eta(sk + 128 + j * MLDSA_POLYETA_PACKEDBYTES, poly0);
+    if (sk)
+      pack_eta(sk + 128 + j * MLDSA_POLYETA_PACKEDBYTES, poly0);
   }
   for (int i = 0; i < K; i++) {
     poly_rej_bounded(poly0, rho_prime, (uint16_t)(L + i));
-    pack_eta(sk + 128 + L * MLDSA_POLYETA_PACKEDBYTES
-             + i * MLDSA_POLYETA_PACKEDBYTES, poly0);
+    if (sk)
+      pack_eta(sk + 128 + L * MLDSA_POLYETA_PACKEDBYTES
+               + i * MLDSA_POLYETA_PACKEDBYTES, poly0);
   }
 
-  /* Copy rho to pk */
-  memcpy(pk, rho, 32);
+  /* Copy rho to pk, start tr hash */
+  if (pk) memcpy(pk, rho, 32);
+  if (compute_tr) {
+    shake256_init(&tr_ctx);
+    shake_update(&tr_ctx, rho, 32);
+  }
 
   /* Step 3: Compute t = A*s1 + s2, row by row.
    * For each row i, compute t[i], then Power2Round → (t1, t0).
-   * Pack t1 into pk, t0 into sk. */
+   * Pack t1 into pk (if non-NULL) and feed into tr hash.
+   * Pack t0 into sk (if non-NULL). */
   for (int i = 0; i < K; i++) {
     /* t_hat[i] = sum_j A_hat[i][j] * s1_hat[j] */
     memset(poly2, 0, N * sizeof(int32_t));
     for (int j = 0; j < L; j++) {
-      unpack_eta(poly0, sk + 128 + j * MLDSA_POLYETA_PACKEDBYTES);
+      /* Regenerate s1[j] from rho' (sk may be NULL) */
+      poly_rej_bounded(poly0, rho_prime, (uint16_t)j);
       ntt(poly0);
       poly_rej_ntt(poly1, rho, (uint8_t)i, (uint8_t)j);
       poly_pointwise_acc(poly2, poly1, poly0);
@@ -1136,8 +1149,7 @@ int ml_dsa_65_keygen(uint8_t *pk, uint8_t *sk, const uint8_t *seed) {
     invntt(poly2);
 
     /* Add s2[i] */
-    unpack_eta(poly0, sk + 128 + L * MLDSA_POLYETA_PACKEDBYTES
-               + i * MLDSA_POLYETA_PACKEDBYTES);
+    poly_rej_bounded(poly0, rho_prime, (uint16_t)(L + i));
     poly_add(poly2, poly2, poly0);
     poly_caddq(poly2);
 
@@ -1148,18 +1160,33 @@ int ml_dsa_65_keygen(uint8_t *pk, uint8_t *sk, const uint8_t *seed) {
       poly1[n] = t0_coeff;                          /* poly1 = t0 */
     }
 
-    /* Pack t1 into pk */
-    pack_t1(pk + 32 + i * 320, poly0);
+    /* Pack t1 into pk and/or feed into tr hash */
+    {
+      uint8_t t1_packed[MLDSA_POLYT1_PACKEDBYTES];
+      pack_t1(t1_packed, poly0);
+      if (pk)
+        memcpy(pk + 32 + i * MLDSA_POLYT1_PACKEDBYTES,
+               t1_packed, MLDSA_POLYT1_PACKEDBYTES);
+      if (compute_tr)
+        shake_update(&tr_ctx, t1_packed, MLDSA_POLYT1_PACKEDBYTES);
+    }
+
     /* Pack t0 into sk */
-    pack_t0(sk + 128 + (L + K) * MLDSA_POLYETA_PACKEDBYTES
-            + i * MLDSA_POLYT0_PACKEDBYTES, poly1);
+    if (sk)
+      pack_t0(sk + 128 + (L + K) * MLDSA_POLYETA_PACKEDBYTES
+              + i * MLDSA_POLYT0_PACKEDBYTES, poly1);
   }
 
-  /* Step 4: Compute tr = H(pk) and store in sk[64..127] */
-  shake256_init(&shake_ctx);
-  shake_update(&shake_ctx, pk, MLDSA_PK_BYTES);
-  shake_finalize(&shake_ctx);
-  shake_squeeze(&shake_ctx, sk + 64, MLDSA_TRBYTES);
+  /* Step 4: Finalize tr = H(pk) */
+  if (compute_tr) {
+    uint8_t tr_buf[MLDSA_TRBYTES];
+    shake_finalize(&tr_ctx);
+    shake_squeeze(&tr_ctx, tr_buf, MLDSA_TRBYTES);
+    if (tr_out)
+      memcpy(tr_out, tr_buf, MLDSA_TRBYTES);
+    if (sk)
+      memcpy(sk + 64, tr_buf, MLDSA_TRBYTES);
+  }
 
   return 0;
 }
@@ -1368,7 +1395,7 @@ int ml_dsa_65_selftest(void) {
   static const size_t msg_len = sizeof(msg) - 1;
 
   /* 1. KeyGen KAT */
-  if (ml_dsa_65_keygen(pk, sk, seed) != 0)
+  if (ml_dsa_65_keygen(pk, sk, NULL, seed) != 0)
     return -1;
 
   sha3_256_raw(pk, MLDSA_PK_BYTES, digest);

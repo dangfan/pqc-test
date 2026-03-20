@@ -68,13 +68,18 @@ int ml_dsa_65_sign(uint8_t *sig, size_t *sig_len,
 /**
  * ML-DSA-65 key generation (FIPS 204, Algorithm 6 – ML-DSA.KeyGen).
  *
- * @param pk      Output public key buffer.
- * @param sk      Output secret key buffer, MLDSA_SK_BYTES bytes.
+ * Any of pk, sk, tr may be NULL — the corresponding output is skipped.
+ * tr = H(pk) is computed via streaming, no pk buffer needed.
+ *
+ * @param pk      Output public key buffer (MLDSA_PK_BYTES), or NULL.
+ * @param sk      Output secret key buffer (MLDSA_SK_BYTES), or NULL.
+ * @param tr      Output tr hash (MLDSA_TRBYTES), or NULL.
  * @param seed    32-byte random seed (xi).
  *
  * @return 0 on success, negative on failure.
  */
-int ml_dsa_65_keygen(uint8_t *pk, uint8_t *sk, const uint8_t *seed);
+int ml_dsa_65_keygen(uint8_t *pk, uint8_t *sk, uint8_t *tr,
+                     const uint8_t *seed);
 
 /**
  * ML-DSA-65 verification (FIPS 204, Algorithm 3 – ML-DSA.Verify).
@@ -93,6 +98,28 @@ int ml_dsa_65_verify(const uint8_t *msg, size_t msg_len,
                      const uint8_t *sig, size_t sig_len,
                      const uint8_t *ctx, size_t ctx_len,
                      const uint8_t *pk);
+
+/**
+ * ML-DSA-65 signing from seed (no sk buffer needed).
+ *
+ * Regenerates s1, s2, t0 from seed on the fly.
+ * Approximately 2x slower than ml_dsa_65_sign due to recomputation.
+ *
+ * @param sig     Output signature buffer, MLDSA_SIG_BYTES bytes.
+ * @param sig_len Set to the actual signature length on success.
+ * @param msg     Message to sign.
+ * @param msg_len Length of message.
+ * @param ctx     Context string (may be NULL if ctx_len == 0).
+ * @param ctx_len Context string length (0..255).
+ * @param seed    32-byte seed used in keygen.
+ * @param tr      Pre-computed tr (MLDSA_TRBYTES), from keygen.
+ *
+ * @return 0 on success, negative on failure.
+ */
+int ml_dsa_65_sign_seed(uint8_t *sig, size_t *sig_len,
+                        const uint8_t *msg, size_t msg_len,
+                        const uint8_t *ctx, size_t ctx_len,
+                        const uint8_t *seed, const uint8_t *tr);
 
 /* Debug: test NTT/INTT round-trip. Returns 0 on success. */
 int ml_dsa_65_selftest(void);

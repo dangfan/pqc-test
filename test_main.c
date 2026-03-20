@@ -112,7 +112,7 @@ static int test_acvp_keygen_vector(void) {
   if (hex2bin(expected_sk, ACVP_TC26_SK_HEX, sizeof(expected_sk)) != 0)
     return 1;
 
-  if (ml_dsa_65_keygen(pk, sk, seed) != 0) {
+  if (ml_dsa_65_keygen(pk, sk, NULL, seed) != 0) {
     printf("FAIL: KeyGen returned non-zero\n");
     return 1;
   }
@@ -138,7 +138,7 @@ static int test_reference_keygen_equivalence(void) {
 
     if (hex2bin(seed, ref_cases[i].seed_hex, sizeof(seed)) != 0)
       return 1;
-    if (ml_dsa_65_keygen(pk, sk, seed) != 0)
+    if (ml_dsa_65_keygen(pk, sk, NULL, seed) != 0)
       return 1;
     if (ref_keygen(ref_pk, ref_sk, seed) != 0) {
       printf("FAIL: Reference keyGen returned non-zero for case %zu\n", i + 1);
@@ -172,7 +172,7 @@ static int test_roundtrip(void) {
 
   /* KeyGen */
   printf("Running KeyGen...\n");
-  int rc = ml_dsa_65_keygen(pk, sk, seed);
+  int rc = ml_dsa_65_keygen(pk, sk, NULL, seed);
   if (rc != 0) {
     printf("FAIL: KeyGen returned %d\n", rc);
     return 1;
@@ -257,7 +257,7 @@ static int test_reference_sign_interop(void) {
 
     if (hex2bin(seed, ref_cases[i].seed_hex, 32) != 0)
       return 1;
-    if (ml_dsa_65_keygen(pk, sk, seed) != 0)
+    if (ml_dsa_65_keygen(pk, sk, NULL, seed) != 0)
       return 1;
     if (ref_keygen(ref_pk, ref_sk, seed) != 0)
       return 1;
@@ -319,7 +319,7 @@ static int test_deterministic(void) {
 
   printf("\n=== Test 2: Deterministic signing reproducibility ===\n");
 
-  ml_dsa_65_keygen(pk, sk, seed);
+  ml_dsa_65_keygen(pk, sk, NULL, seed);
 
   const uint8_t msg[] = "determinism check";
   size_t msg_len = sizeof(msg) - 1;
@@ -359,7 +359,7 @@ static int test_context_string(void) {
 
   printf("\n=== Test 3: Context string support ===\n");
 
-  ml_dsa_65_keygen(pk, sk, seed);
+  ml_dsa_65_keygen(pk, sk, NULL, seed);
 
   const uint8_t msg[] = "context test message";
   size_t msg_len = sizeof(msg) - 1;
@@ -436,7 +436,7 @@ static int test_random_interop(void) {
       shake_squeeze(&prng, ctx, ctx_len);
 
     /* KeyGen: both implementations */
-    if (ml_dsa_65_keygen(pk, sk, seed) != 0) {
+    if (ml_dsa_65_keygen(pk, sk, NULL, seed) != 0) {
       printf("FAIL round %d: local keygen\n", round);
       return 1;
     }
