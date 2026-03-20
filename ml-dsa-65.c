@@ -1209,7 +1209,10 @@ static void restore_challenge(const uint8_t c_tilde[MLDSA_C_TILDE_BYTES],
 
 /* ------------------------------------------------------------------ */
 
-/* Re-derive rho and rho_prime_keygen from seed (cheap, one SHAKE). */
+/* Re-derive rho and rho_prime_keygen from seed.
+ * Marked noinline so the ~200B SHA3 context is freed on return,
+ * rather than inflating the caller's stack frame. */
+__attribute__((noinline))
 static void derive_keygen_secrets(const uint8_t seed[32],
                                   uint8_t rho[32],
                                   uint8_t rho_prime_keygen[64],
@@ -1800,17 +1803,16 @@ static void recompute_and_pack_z(
   pack_z(buf, poly0);
 }
 
-int ml_dsa_65_sign_seed_streaming(
+/* Phase 0: full signing passes 1-3, output first chunk */
+static int sign_seed_streaming_phase0(
     uint8_t *out, size_t out_size,
     mldsa_sign_state_t *state,
     const uint8_t *msg, size_t msg_len,
     const uint8_t *ctx, size_t ctx_len,
     const uint8_t *tr) {
 
-  if (state->phase == 0) {
-    /* ---- Phase 0: full signing, output first chunk ---- */
 
-    /* Run the existing sign_seed to produce the full signature
+  /* Run the existing sign_seed to produce the full signature
      * into a temporary layout: we need c_tilde, z[0..4], hint.
      *
      * But we don't have a 3309B buffer.  Instead, replicate the
@@ -1960,14 +1962,14 @@ int ml_dsa_65_sign_seed_streaming(
           invntt(poly0);
           poly_caddq(poly0);
 
-          pke_store_poly(PKE_SLOT1, poly0);
+          pke_store_poly(PKE_SLOT1, poly0);  /* save w */
           restore_challenge(state->c_tilde, poly0);
           poly_rej_bounded(poly0, rho_prime_keygen, (uint16_t)(L + i));
           poly_caddq(poly0);
           {
             int32_t cs2[N];
             poly_mul_challenge(cs2, poly0);
-            pke_load_poly(poly0, PKE_SLOT1);
+            pke_load_poly(poly0, PKE_SLOT1);  /* w */
             poly_sub(poly0, poly0, cs2);
           }
           poly_reduce(poly0);
@@ -1994,52 +1996,61 @@ int ml_dsa_65_sign_seed_streaming(
       size_t off = 0;
       memcpy(out + off, state->c_tilde, MLDSA_C_TILDE_BYTES);
       off += MLDSA_C_TILDE_BYTES;
-      {
-        int32_t p0[N], p1[N];
-        for (int j = 0; j < 2; j++) {
-          recompute_and_pack_z(out + off, j,
-              state->rho_prime_sign, rho_prime_keygen,
-              state->c_tilde, kappa, p0, p1);
-          off += MLDSA_POLYZ_PACKEDBYTES;
-        }
+      for (int j = 0; j < 2; j++) {
+        recompute_and_pack_z(out + off, j,
+            state->rho_prime_sign, rho_prime_keygen,
+            state->c_tilde, kappa, poly0, poly1);
+        off += MLDSA_POLYZ_PACKEDBYTES;
       }
       return (int)off;  /* 1328, more to come */
     }
-  }
+}
 
-  else if (state->phase == 1) {
-    /* Output z[2](640) + z[3](640) = 1280 */
-    uint8_t rho[32], rho_prime_keygen[64];
-    derive_keygen_secrets(state->seed, rho, rho_prime_keygen, NULL);
-    int32_t p0[N], p1[N];
-    size_t off = 0;
-    for (int j = 2; j < 4; j++) {
-      recompute_and_pack_z(out + off, j,
-          state->rho_prime_sign, rho_prime_keygen,
-          state->c_tilde, state->kappa, p0, p1);
-      off += MLDSA_POLYZ_PACKEDBYTES;
-    }
-    state->phase = 2;
-    return (int)off; /* 1280, more to come */
-  }
+/* Phase 1/2: recompute z[j] from state and output next chunk */
+static int sign_seed_streaming_continue(
+    uint8_t *out, size_t out_size,
+    mldsa_sign_state_t *state) {
+  SHA3_CTX_T shake_ctx;
+  uint8_t rho[32], rho_prime_keygen[64];
+  derive_keygen_secrets(state->seed, rho, rho_prime_keygen, NULL);
+  int32_t p0[N], p1[N];
+  size_t off = 0;
 
-  else if (state->phase == 2) {
-    /* Output z[4](640) + hint(61) = 701 */
-    uint8_t rho[32], rho_prime_keygen[64];
-    derive_keygen_secrets(state->seed, rho, rho_prime_keygen, NULL);
-    int32_t p0[N], p1[N];
-    size_t off = 0;
-    recompute_and_pack_z(out + off, 4,
+  /* Determine which z indices to output based on phase */
+  int j_start = (state->phase == 1) ? 2 : 4;
+  int j_end   = (state->phase == 1) ? 4 : L;
+
+  for (int j = j_start; j < j_end; j++) {
+    recompute_and_pack_z(out + off, j,
         state->rho_prime_sign, rho_prime_keygen,
         state->c_tilde, state->kappa, p0, p1);
     off += MLDSA_POLYZ_PACKEDBYTES;
+  }
+
+  if (state->phase == 2) {
+    /* Append hint after last z */
     memcpy(out + off, state->hint, OMEGA + K);
     off += OMEGA + K;
     state->phase = 0; /* done */
-    return (int)off; /* final chunk bytes */
+  } else {
+    state->phase = 2;
   }
+  return (int)off;
+}
 
-  return -1; /* invalid phase */
+int ml_dsa_65_sign_seed_streaming(
+    uint8_t *out, size_t out_size,
+    mldsa_sign_state_t *state,
+    const uint8_t *msg, size_t msg_len,
+    const uint8_t *ctx, size_t ctx_len,
+    const uint8_t *tr) {
+
+  if (state->phase == 0)
+    return sign_seed_streaming_phase0(out, out_size, state,
+                                       msg, msg_len, ctx, ctx_len, tr);
+  else if (state->phase == 1 || state->phase == 2)
+    return sign_seed_streaming_continue(out, out_size, state);
+  return -1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -2083,6 +2094,7 @@ int ml_dsa_65_keygen_streaming(
     mldsa_keygen_state_t *state,
     uint8_t *tr_out) {
 
+  SHA3_CTX_T shake_ctx;
   uint8_t rho[32], rho_prime[64];
   derive_keygen_secrets(state->seed, rho, rho_prime, NULL);
   int32_t poly0[N], poly1[N];
