@@ -449,27 +449,61 @@ static void poly_mul_acc(int32_t c[N], const int32_t a[N], const int32_t b[N]) {
 /* Multiply challenge (in PKE_SLOT0) by polynomial b in Z_q[X]/(X^N+1).
  * Challenge c is read from PKE registers — no stack poly needed for it.
  * Accumulates into int32_t result with per-step mod Q (no int64_t acc[N]).
- * b must have coefficients in [0, Q). Result in [0, Q). */
+ * b must have coefficients in [0, Q). Result in [0, Q).
+ *
+ * Kronecker big-int multiply is inlined to share the tmp buffer for both
+ * operand writes and product readback, eliminating a separate prod[] array
+ * and the kron_bigint_mul call frame.  The 'a' operand is written to PKE
+ * once per outer (gi) iteration instead of every inner (gj) iteration. */
 static void poly_mul_challenge(int32_t result[N], const int32_t b[N]) {
   int32_t a_chunk[KRON_G];               /* 64 bytes: challenge group */
-  uint32_t a_packed[KRON_PACK_WORDS];
-  uint32_t b_packed[KRON_PACK_WORDS];
-  uint32_t prod[KRON_PROD_WORDS];
+  uint32_t a_packed[KRON_PACK_WORDS];    /* 100 bytes */
+  uint32_t b_packed[KRON_PACK_WORDS];    /* 100 bytes */
+  uint32_t tmp[KRON_PKE_LEN];            /* 216 bytes: shared PKE I/O + product */
 
   memset(result, 0, N * sizeof(int32_t));
   kron_mmm_setup();
 
+  /* Inlined Kronecker big-int multiply (cf. kron_bigint_mul).
+   *
+   * Compared to calling kron_bigint_mul per (gi, gj) pair:
+   *   1. The shared tmp[KRON_PKE_LEN] serves triple duty — write operand a
+   *      to PKE, write operand b to PKE, and hold the product readback —
+   *      eliminating a separate prod[KRON_PROD_WORDS] (200 B) on the stack.
+   *   2. The kron_bigint_mul call frame (~288 B) is eliminated entirely,
+   *      flattening the deepest call chain of the sign path.
+   *   3. Operand 'a' (the challenge group) is written to KRON_REG_A once
+   *      per outer gi iteration; the original code rewrote it every (gi,gj)
+   *      pair — saving 16 × (KRON_T − 1) redundant PKE writes per call. */
   for (int gi = 0; gi < KRON_T; gi++) {
     eccPKEReadBuf((uint32_t *)a_chunk, PKE_SLOT0 + gi, KRON_G);
     kron_pack(a_packed, a_chunk, KRON_G);
 
+    /* Pack challenge group into big-endian PKE format and write once */
+    memset(tmp, 0, KRON_PKE_LEN * 4);
+    memcpy(tmp, a_packed, KRON_PACK_WORDS * 4);
+    host_to_pke(tmp, KRON_PKE_LEN);
+    eccPKEWriteBuf(KRON_REG_A, tmp, KRON_PKE_LEN);
+
     for (int gj = 0; gj < KRON_T; gj++) {
       kron_pack(b_packed, &b[gj * KRON_G], KRON_G);
-      kron_bigint_mul(prod, a_packed, b_packed);
+
+      /* Pack b group and write to PKE */
+      memset(tmp, 0, KRON_PKE_LEN * 4);
+      memcpy(tmp, b_packed, KRON_PACK_WORDS * 4);
+      host_to_pke(tmp, KRON_PKE_LEN);
+      eccPKEWriteBuf(KRON_REG_B, tmp, KRON_PKE_LEN);
+
+      /* Hardware big-int multiply: KRON_REG_R = a * b mod (2^M − 1) */
+      sm2MonMul(KRON_REG_R, KRON_REG_A, KRON_REG_B);
+
+      /* Reuse tmp for product readback (host word order) */
+      eccPKEReadBuf(tmp, KRON_REG_R, KRON_PKE_LEN);
+      pke_to_host(tmp, KRON_PKE_LEN);
 
       int base = (gi + gj) * KRON_G;
       for (int k = 0; k < 2 * KRON_G - 1; k++) {
-        int64_t coeff = kron_unpack_one(k, prod);
+        int64_t coeff = kron_unpack_one(k, tmp);
         int idx = base + k;
         int64_t v;
         if (idx < N) {
@@ -736,6 +770,20 @@ static int32_t low_bits(int32_t a) {
   return r0;
 }
 
+/* Encode w1 = HighBits(w) and feed directly into a SHAKE context.
+ * Processes 32 coefficients (16 bytes) at a time, avoiding a full
+ * POLYW1_PACKEDBYTES (128-byte) intermediate buffer on the stack. */
+static void __attribute__((noinline)) w1_encode_update(SHA3_CTX_T *ctx,
+                                                       const int32_t w[N]) {
+  uint8_t chunk[16];
+  for (int i = 0; i < N; i += 32) {
+    for (int j = 0; j < 16; j++)
+      chunk[j] = (uint8_t)((uint32_t)high_bits(w[i + 2*j])
+                          | ((uint32_t)high_bits(w[i + 2*j + 1]) << 4));
+    shake_update(ctx, chunk, 16);
+  }
+}
+
 static int make_hint(int32_t z, int32_t r) {
   return (high_bits(r) != high_bits(freeze(r + z)));
 }
@@ -833,12 +881,11 @@ int ml_dsa_65_sign(uint8_t *sig, size_t *sig_len,
   uint8_t mu[64];
   uint8_t rho_prime[64];
   uint8_t c_tilde[MLDSA_C_TILDE_BYTES]; /* 48 bytes */
-  uint8_t w1_packed[MLDSA_POLYW1_PACKEDBYTES]; /* 128 bytes */
   uint16_t kappa;
   int reject;
   /* PKE_SLOT0 (regs 4-19):  challenge c (persistent across passes)
    * PKE_SLOT1 (regs 20-35): w_hat accumulator / temp storage
-   * Total stack ≈ 2048 + 208 + 64 + 64 + 48 + 128 + misc ≈ 2.6 KB */
+   * Total stack ≈ 2048 + 208 + 64 + 64 + 48 + misc ≈ 2.5 KB */
 
   if (ctx_len > 255) return -1;
 
@@ -885,11 +932,8 @@ int ml_dsa_65_sign(uint8_t *sig, size_t *sig_len,
       pke_load_poly(poly0, PKE_SLOT1);
       invntt(poly0);
       poly_caddq(poly0);
-      /* Extract w1 = HighBits(w[i]) and encode */
-      for (int n = 0; n < N; n++)
-        poly1[n] = high_bits(poly0[n]);
-      pack_w1(w1_packed, poly1);
-      shake_update(&shake_ctx, w1_packed, MLDSA_POLYW1_PACKEDBYTES);
+      /* Encode w1 = HighBits(w[i]) directly into SHAKE */
+      w1_encode_update(&shake_ctx, poly0);
     }
 
     shake_finalize(&shake_ctx);
