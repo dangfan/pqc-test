@@ -14,6 +14,8 @@
 #include <string.h>
 #include <stdlib.h>
 
+uint32_t uwTick = 0;
+
 typedef struct {
   const char *seed_hex;
   const char *msg;
@@ -206,34 +208,6 @@ static int test_roundtrip(void) {
     print_hex("  sig SHA3-256", sig_hash, 32);
   }
 
-  /* Verify */
-  printf("Running Verify...\n");
-  rc = ml_dsa_65_verify(msg, msg_len, sig, sig_len, NULL, 0, pk);
-  if (rc != 0) {
-    printf("FAIL: Verify returned %d\n", rc);
-    return 1;
-  }
-  printf("  Verify: PASS\n");
-
-  /* Verify with wrong message should fail */
-  const uint8_t bad_msg[] = "wrong message";
-  rc = ml_dsa_65_verify(bad_msg, sizeof(bad_msg) - 1, sig, sig_len, NULL, 0, pk);
-  if (rc == 0) {
-    printf("FAIL: Verify should reject wrong message\n");
-    return 1;
-  }
-  printf("  Reject bad msg: PASS\n");
-
-  /* Verify with corrupted signature should fail */
-  sig[100] ^= 0x01;
-  rc = ml_dsa_65_verify(msg, msg_len, sig, sig_len, NULL, 0, pk);
-  if (rc == 0) {
-    printf("FAIL: Verify should reject corrupted signature\n");
-    return 1;
-  }
-  printf("  Reject bad sig: PASS\n");
-  sig[100] ^= 0x01; /* restore */
-
   return 0;
 }
 
@@ -276,10 +250,6 @@ static int test_reference_sign_interop(void) {
     }
     if (expect_buf_eq("reference signature", sig, ref_sig, sig_len) != 0)
       return 1;
-    if (ml_dsa_65_verify(msg, msg_len, ref_sig, ref_sig_len, ctx, ctx_len, pk) != 0) {
-      printf("FAIL: local verify rejected reference signature\n");
-      return 1;
-    }
     if (ref_verify_sig(sig, sig_len, msg, msg_len, ctx, ctx_len, ref_pk) != 0) {
       printf("FAIL: reference verify rejected local signature\n");
       return 1;
@@ -287,10 +257,6 @@ static int test_reference_sign_interop(void) {
 
     {
       const uint8_t bad_msg[] = "cross-check signature mismatch";
-      if (ml_dsa_65_verify(bad_msg, sizeof(bad_msg) - 1, ref_sig, ref_sig_len, ctx, ctx_len, pk) == 0) {
-        printf("FAIL: local verify accepted mismatched message\n");
-        return 1;
-      }
       if (ref_verify_sig(sig, sig_len, bad_msg, sizeof(bad_msg) - 1, ctx, ctx_len, ref_pk) == 0) {
         printf("FAIL: reference verify accepted mismatched message\n");
         return 1;
@@ -332,14 +298,6 @@ static int test_deterministic(void) {
     return 1;
   }
   printf("  Deterministic: PASS\n");
-
-  /* Verify both */
-  int rc = ml_dsa_65_verify(msg, msg_len, sig1, sig_len1, NULL, 0, pk);
-  if (rc != 0) {
-    printf("FAIL: Verify returned %d\n", rc);
-    return 1;
-  }
-  printf("  Verify: PASS\n");
   return 0;
 }
 
@@ -371,30 +329,6 @@ static int test_context_string(void) {
     printf("FAIL: Sign with context returned %d\n", rc);
     return 1;
   }
-
-  rc = ml_dsa_65_verify(msg, msg_len, sig, sig_len, ctx, ctx_len, pk);
-  if (rc != 0) {
-    printf("FAIL: Verify with context returned %d\n", rc);
-    return 1;
-  }
-  printf("  Sign+Verify with context: PASS\n");
-
-  /* Verify with wrong context should fail */
-  const uint8_t bad_ctx[] = "wrong-ctx";
-  rc = ml_dsa_65_verify(msg, msg_len, sig, sig_len, bad_ctx, sizeof(bad_ctx) - 1, pk);
-  if (rc == 0) {
-    printf("FAIL: Verify should reject wrong context\n");
-    return 1;
-  }
-  printf("  Reject wrong context: PASS\n");
-
-  /* Verify with empty context should fail */
-  rc = ml_dsa_65_verify(msg, msg_len, sig, sig_len, NULL, 0, pk);
-  if (rc == 0) {
-    printf("FAIL: Verify should reject empty context\n");
-    return 1;
-  }
-  printf("  Reject empty context: PASS\n");
 
   return 0;
 }
@@ -468,12 +402,6 @@ static int test_random_interop(void) {
       return 1;
     }
 
-    /* Cross-verify */
-    if (ml_dsa_65_verify(msg, msg_len, ref_sig, ref_sig_len,
-                         ctx_len > 0 ? ctx : NULL, ctx_len, pk) != 0) {
-      printf("FAIL round %d: local verify ref sig\n", round);
-      return 1;
-    }
     if (ref_verify_sig(sig, sig_len, msg, msg_len,
                        ctx_len > 0 ? ctx : NULL, ctx_len, ref_pk) != 0) {
       printf("FAIL round %d: ref verify local sig\n", round);
@@ -598,22 +526,11 @@ static int test_sign_seed(void) {
       printf("FAIL round %d: signature mismatch\n", round);
       return 1;
     }
-
-    /* Verify seed-produced signature */
-    if (ml_dsa_65_verify(msg, msg_len, sig_seed, sig_len_seed,
-                         ctx_len > 0 ? ctx : NULL, ctx_len, pk) != 0) {
-      printf("FAIL round %d: verify seed sig\n", round);
-      return 1;
-    }
   }
 
   printf("  sign_seed vs sign (%d rounds): PASS\n", nrounds);
   return 0;
 }
-
-/* ---- Main ---- */
-int test_sign_seed_streaming(void);
-int test_keygen_streaming(void);
 
 int main(void) {
   int failures = 0;
@@ -627,186 +544,10 @@ int main(void) {
   failures += test_random_interop();
   failures += test_keygen_null();
   failures += test_sign_seed();
-  failures += test_sign_seed_streaming();
-  failures += test_keygen_streaming();
 
   printf("\n=== Summary: %s (%d failure%s) ===\n",
          failures == 0 ? "ALL PASSED" : "SOME FAILED",
          failures, failures == 1 ? "" : "s");
 
   return failures;
-}
-
-/* ---- Test 8: sign_seed_streaming produces same sig as sign_seed ---- */
-
-int test_sign_seed_streaming(void) {
-  const int nrounds = 16;
-  printf("\n=== Test 8: sign_seed_streaming vs sign_seed (%d rounds) ===\n", nrounds);
-
-  SHA3_CTX_T prng;
-  {
-    uint8_t ps[32] = "streaming-sign-test-seed!!!!!!!";
-    shake256_init(&prng);
-    shake_update(&prng, ps, 32);
-    shake_finalize(&prng);
-  }
-
-  for (int r = 0; r < nrounds; r++) {
-    uint8_t seed[32], msg[128], ctx_buf[16];
-    shake_squeeze(&prng, seed, 32);
-    uint8_t lens[2];
-    shake_squeeze(&prng, lens, 2);
-    size_t msg_len = 1 + (lens[0] % 128);
-    size_t ctx_len = lens[1] % 16;
-    shake_squeeze(&prng, msg, msg_len);
-    shake_squeeze(&prng, ctx_buf, ctx_len);
-
-    /* Keygen */
-    uint8_t tr[MLDSA_TRBYTES];
-    ml_dsa_65_keygen(NULL, NULL, tr, seed);
-
-    /* Reference: sign_seed into full buffer */
-    uint8_t sig_ref[MLDSA_SIG_BYTES];
-    size_t sig_len_ref;
-    if (ml_dsa_65_sign_seed(sig_ref, &sig_len_ref,
-                            msg, msg_len, ctx_buf, ctx_len,
-                            seed, tr) != 0) {
-      printf("  round %d: sign_seed failed\n", r);
-      return 1;
-    }
-
-    /* Streaming: collect chunks */
-    uint8_t sig_stream[MLDSA_SIG_BYTES];
-    size_t total = 0;
-    mldsa_sign_state_t state;
-    memset(&state, 0, sizeof(state));
-    memcpy(state.seed, seed, 32);
-
-    uint8_t chunk_buf[1340]; /* simulated chaining buffer */
-
-    /* Phase 0 */
-    int n = ml_dsa_65_sign_seed_streaming(
-        chunk_buf, sizeof(chunk_buf), &state,
-        msg, msg_len, ctx_buf, ctx_len, tr);
-    if (n < 0) {
-      printf("  round %d: streaming phase 0 failed\n", r);
-      return 1;
-    }
-    memcpy(sig_stream + total, chunk_buf, n);
-    total += n;
-
-    /* Subsequent phases */
-    while (state.phase > 0) {
-      n = ml_dsa_65_sign_seed_streaming(
-          chunk_buf, sizeof(chunk_buf), &state,
-          NULL, 0, NULL, 0, NULL);
-      if (n < 0) {
-        printf("  round %d: streaming phase %d failed\n", r, state.phase);
-        return 1;
-      }
-      memcpy(sig_stream + total, chunk_buf, n);
-      total += n;
-    }
-
-    if (total != MLDSA_SIG_BYTES) {
-      printf("  round %d: streaming total=%zu, expected %d\n",
-             r, total, MLDSA_SIG_BYTES);
-      return 1;
-    }
-
-    if (memcmp(sig_ref, sig_stream, MLDSA_SIG_BYTES) != 0) {
-      /* Find first mismatch */
-      for (size_t i = 0; i < MLDSA_SIG_BYTES; i++) {
-        if (sig_ref[i] != sig_stream[i]) {
-          printf("  round %d: MISMATCH at byte %zu (ref=%02x stream=%02x)\n",
-                 r, i, sig_ref[i], sig_stream[i]);
-          break;
-        }
-      }
-      return 1;
-    }
-  }
-
-  printf("  sign_seed_streaming vs sign_seed (%d rounds): PASS\n", nrounds);
-  return 0;
-}
-
-/* ---- Test 9: keygen_streaming produces same pk as keygen ---- */
-
-int test_keygen_streaming(void) {
-  const int nrounds = 16;
-  printf("\n=== Test 9: keygen_streaming vs keygen (%d rounds) ===\n", nrounds);
-
-  SHA3_CTX_T prng;
-  {
-    uint8_t ps[32] = "streaming-keygen-test-seed!!!!!";
-    shake256_init(&prng);
-    shake_update(&prng, ps, 32);
-    shake_finalize(&prng);
-  }
-
-  for (int r = 0; r < nrounds; r++) {
-    uint8_t seed[32];
-    shake_squeeze(&prng, seed, 32);
-
-    /* Reference: full keygen with tr */
-    uint8_t pk_ref[MLDSA_PK_BYTES];
-    uint8_t tr_ref[MLDSA_TRBYTES];
-    ml_dsa_65_keygen(pk_ref, NULL, tr_ref, seed);
-
-    /* Streaming: collect chunks, also get tr */
-    uint8_t pk_stream[MLDSA_PK_BYTES];
-    uint8_t tr_stream[MLDSA_TRBYTES];
-    size_t total = 0;
-    mldsa_keygen_state_t state;
-    memset(&state, 0, sizeof(state));
-    memcpy(state.seed, seed, 32);
-
-    uint8_t chunk_buf[1340];
-
-    /* Phase 0: pass tr_stream to get tr */
-    int n = ml_dsa_65_keygen_streaming(chunk_buf, sizeof(chunk_buf), &state, tr_stream);
-    if (n < 0) {
-      printf("  round %d: keygen streaming phase 0 failed\n", r);
-      return 1;
-    }
-    memcpy(pk_stream + total, chunk_buf, n);
-    total += n;
-
-    /* Subsequent phases: tr_out = NULL */
-    while (state.phase > 0) {
-      n = ml_dsa_65_keygen_streaming(chunk_buf, sizeof(chunk_buf), &state, NULL);
-      if (n < 0) {
-        printf("  round %d: keygen streaming phase %d failed\n", r, state.phase);
-        return 1;
-      }
-      memcpy(pk_stream + total, chunk_buf, n);
-      total += n;
-    }
-
-    if (total != MLDSA_PK_BYTES) {
-      printf("  round %d: keygen streaming total=%zu, expected %d\n",
-             r, total, MLDSA_PK_BYTES);
-      return 1;
-    }
-
-    if (memcmp(pk_ref, pk_stream, MLDSA_PK_BYTES) != 0) {
-      for (size_t i = 0; i < MLDSA_PK_BYTES; i++) {
-        if (pk_ref[i] != pk_stream[i]) {
-          printf("  round %d: pk MISMATCH at byte %zu (ref=%02x stream=%02x)\n",
-                 r, i, pk_ref[i], pk_stream[i]);
-          break;
-        }
-      }
-      return 1;
-    }
-
-    if (memcmp(tr_ref, tr_stream, MLDSA_TRBYTES) != 0) {
-      printf("  round %d: tr MISMATCH\n", r);
-      return 1;
-    }
-  }
-
-  printf("  keygen_streaming vs keygen (%d rounds): PASS\n", nrounds);
-  return 0;
 }

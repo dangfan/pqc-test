@@ -3,7 +3,7 @@ project(pqc-test C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -O2 -ffunction-sections -fdata-sections")
-set(CMAKE_EXE_LINKER_FLAGS  "${CMAKE_EXE_LINKER_FLAGS} -Wl,--gc-sections")
+#set(CMAKE_EXE_LINKER_FLAGS  "${CMAKE_EXE_LINKER_FLAGS} -Wl,--gc-sections")
 
 include(FetchContent)
 
@@ -11,7 +11,7 @@ include(FetchContent)
 FetchContent_Declare(
     canokey_crypto
     GIT_REPOSITORY https://github.com/canokeys/canokey-crypto.git
-    GIT_TAG master
+    GIT_TAG e17cf7dda27e67098726e202a89fb4bc5058411b
     SOURCE_SUBDIR DO_NOT_RUN_CMAKE
 )
 # Fetch mldsa-native reference implementation for cross-check testing

@@ -82,24 +82,6 @@ int ml_dsa_65_keygen(uint8_t *pk, uint8_t *sk, uint8_t *tr,
                      const uint8_t *seed);
 
 /**
- * ML-DSA-65 verification (FIPS 204, Algorithm 3 – ML-DSA.Verify).
- *
- * @param msg     Message that was signed.
- * @param msg_len Length of message.
- * @param sig     Signature, MLDSA_SIG_BYTES bytes.
- * @param sig_len Signature length (must equal MLDSA_SIG_BYTES).
- * @param ctx     Context string (may be NULL if ctx_len == 0).
- * @param ctx_len Context string length (0..255).
- * @param pk      Public key, MLDSA_PK_BYTES bytes.
- *
- * @return 0 on success (valid signature), negative on failure.
- */
-int ml_dsa_65_verify(const uint8_t *msg, size_t msg_len,
-                     const uint8_t *sig, size_t sig_len,
-                     const uint8_t *ctx, size_t ctx_len,
-                     const uint8_t *pk);
-
-/**
  * ML-DSA-65 signing from seed (no sk buffer needed).
  *
  * Regenerates s1, s2, t0 from seed on the fly.
@@ -120,9 +102,6 @@ int ml_dsa_65_sign_seed(uint8_t *sig, size_t *sig_len,
                         const uint8_t *msg, size_t msg_len,
                         const uint8_t *ctx, size_t ctx_len,
                         const uint8_t *seed, const uint8_t *tr);
-
-/* Debug: test NTT/INTT round-trip. Returns 0 on success. */
-int ml_dsa_65_selftest(void);
 
 /* ---- Streaming output variants ---- */
 
